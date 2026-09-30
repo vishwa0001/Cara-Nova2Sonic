@@ -1,0 +1,391 @@
+import io
+import json
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT.parent))
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "lambda"))
+
+os.environ.setdefault("CONNECT_CONTACT_FLOW_ID", "flow-123")
+os.environ.setdefault("CONNECT_INSTANCE_ID", "inst-123")
+os.environ.setdefault("CONNECT_SOURCE_PHONE_NUMBER", "+18005550100")
+os.environ.setdefault("AWS_LAMBDA_FUNCTION_NAME", "cara-health-bot-campaign-dialer")
+os.environ.setdefault("BATCHES_TABLE_NAME", "TalkingBotCallBatches-dev")
+os.environ.setdefault("PATIENTS_TABLE_NAME", "TalkingBotPatientRecords-dev")
+
+import campaign_intake
+import campaign_dialer
+import session_context
+from utils.agent_availability import check_agent_availability
+
+
+class ComprehensiveMatrixTests(unittest.TestCase):
+
+    # -------------------------------------------------------------
+    # 1. INTAKE PARSING & CAMPAIGN-LEVEL CONFIG
+    # -------------------------------------------------------------
+    def test_intake_campaign_level_toggle(self):
+        cases = [
+            (True, "+18145551234", "yes", "DIRECT_HUMAN_HANDOFF", "+18145551234"),
+            (False, "+18145551234", "no", "NORMAL", "+18145551234"),
+        ]
+        for toggle, agent_phone, exp_direct, exp_mode, exp_phone in cases:
+            with self.subTest(toggle=toggle):
+                csv = (
+                    "empi,first_name,last_name,gender,phone_number,practice_name,practice_callback_number\n"
+                    "P1,Jane,Doe,Female,+18145551001,Practice X,+18005550100\n"
+                )
+                mock_s3 = MagicMock()
+                mock_s3.get_object.return_value = {"Body": io.BytesIO(csv.encode("utf-8"))}
+                cfg = {"directAgentEnabled": toggle, "humanAgentPhoneNumber": agent_phone}
+                res = campaign_intake._load_patients(mock_s3, "b", "c", config=cfg)
+                self.assertEqual(res[0]["direct_agent"], exp_direct)
+                self.assertEqual(res[0]["callMode"], exp_mode)
+                self.assertEqual(res[0]["humanAgentPhoneNumber"], exp_phone)
+
+    def test_intake_ignores_legacy_direct_agent_csv_column(self):
+        csv = (
+            "empi,first_name,last_name,gender,phone_number,practice_name,practice_callback_number,direct_agent\n"
+            "P1,Jane,Doe,Female,+18145551001,Practice X,+18005550100,maybe\n"
+        )
+        mock_s3 = MagicMock()
+        mock_s3.get_object.return_value = {"Body": io.BytesIO(csv.encode("utf-8"))}
+        res = campaign_intake._load_patients(mock_s3, "b", "c", config={"directAgentEnabled": False})
+        self.assertEqual(res[0]["direct_agent"], "no")
+        self.assertEqual(res[0]["callMode"], "NORMAL")
+
+    # -------------------------------------------------------------
+    # 2. AGENT AVAILABILITY API PERMUTATIONS
+    # -------------------------------------------------------------
+    @patch("requests.get")
+    def test_agent_availability_api_responses(self, mock_get):
+        # Case A: Available True
+        mock_get.return_value.raise_for_status = MagicMock()
+        mock_get.return_value.json.return_value = {"available": True, "agentPhone": "+15822671755"}
+        self.assertTrue(check_agent_availability({"patientId": "p1"}))
+
+        # Case B: Available False
+        mock_get.return_value.json.return_value = {"available": False}
+        self.assertFalse(check_agent_availability({"patientId": "p2"}))
+
+        # Case C: HTTP 500
+        mock_get.side_effect = Exception("HTTP 500 Server Error")
+        self.assertFalse(check_agent_availability({"patientId": "p3"}))
+
+        # Case D: Network Timeout
+        mock_get.side_effect = Exception("Connection Timeout after 5000ms")
+        self.assertFalse(check_agent_availability({"patientId": "p4"}))
+
+    # -------------------------------------------------------------
+    # 3. CALL PLACEMENT ROUTING MATRIX (CLIENT TESTING)
+    # -------------------------------------------------------------
+    def test_call_placement_matrix(self):
+        mock_table = MagicMock()
+        mock_connect = MagicMock()
+        mock_connect.start_outbound_voice_contact.return_value = {"ContactId": "c-123"}
+
+        test_matrix = [
+            # direct_agent, initial callMode, exp_call_mode
+            ("yes", "DIRECT_HUMAN_HANDOFF", "DIRECT_HUMAN_HANDOFF"),
+            ("no",  "NORMAL",               "NORMAL"),
+        ]
+
+        for direct_val, init_mode, exp_mode in test_matrix:
+            with self.subTest(direct_agent=direct_val, init_mode=init_mode):
+                mock_connect.reset_mock()
+                patient = {
+                    "patientId": "P-TEST",
+                    "firstName": "Alice",
+                    "lastName": "Walker",
+                    "customerName": "Alice Walker",
+                    "phoneNumber": "+18145559999",
+                    "practiceName": "Health Center",
+                    "direct_agent": direct_val,
+                    "callMode": init_mode,
+                    "humanAgentPhoneNumber": "+15822671755",
+                }
+                contact_id = campaign_dialer._place_call(mock_table, mock_connect, patient, "camp-1")
+                attrs = mock_connect.start_outbound_voice_contact.call_args[1]["Attributes"]
+
+                self.assertEqual(attrs["callMode"], exp_mode)
+                self.assertEqual(attrs["direct_agent"], direct_val)
+                self.assertIn("humanAgentPhoneNumber", attrs)
+                self.assertEqual(attrs["humanAgentPhoneNumber"], "+15822671755")
+                self.assertIn("coachingGreeting", attrs)
+                self.assertIn("Is now a good time?", attrs["coachingGreeting"])
+                self.assertIn("identityPrompt", attrs)
+                self.assertIn("Alice Walker", attrs["identityPrompt"])
+
+    @patch("session_context._get_client", side_effect=Exception("No direct lambda"))
+    @patch("urllib.request.urlopen")
+    def test_session_context_transfer_time_availability_routing(self, mock_urlopen, mock_get_client):
+        import session_context
+        # Case A: Available at transfer time
+        mock_resp_avail = MagicMock()
+        mock_resp_avail.read.return_value = json.dumps({
+            "available": True,
+            "agentPhone": "+15822671755",
+            "agentId": "agent-001",
+            "agentName": "Sarah Jenkins",
+            "checkedAt": "2026-09-02T12:00:00Z",
+        }).encode("utf-8")
+        mock_resp_avail.__enter__.return_value = mock_resp_avail
+        mock_urlopen.return_value = mock_resp_avail
+
+        event_avail = {
+            "Details": {
+                "Parameters": {
+                    "operation": "checkAgentAvailability",
+                    "patientId": "P-001",
+                },
+                "ContactData": {
+                    "Attributes": {
+                        "humanAgentPhoneNumber": "+18145559999",
+                    }
+                }
+            }
+        }
+        res_avail = session_context.handler(event_avail, None)
+        self.assertEqual(res_avail["available"], "true")
+        self.assertEqual(res_avail["agentPhone"], "+18145559999")
+        self.assertEqual(res_avail["agentName"], "Sarah Jenkins")
+
+        # Case B: Unavailable at transfer time -> routes to unavailable callback branch
+        mock_resp_unavail = MagicMock()
+        mock_resp_unavail.read.return_value = json.dumps({
+            "available": False,
+            "agentPhone": None,
+            "agentId": None,
+            "agentName": None,
+            "checkedAt": "2026-09-02T12:00:00Z",
+        }).encode("utf-8")
+        mock_resp_unavail.__enter__.return_value = mock_resp_unavail
+        mock_urlopen.return_value = mock_resp_unavail
+
+        event_unavail = {
+            "Details": {
+                "Parameters": {
+                    "operation": "checkAgentAvailability",
+                    "patientId": "P-002",
+                },
+                "ContactData": {
+                    "Attributes": {
+                        "humanAgentPhoneNumber": "+18145559999",
+                    }
+                }
+            }
+        }
+        res_unavail = session_context.handler(event_unavail, None)
+        self.assertEqual(res_unavail["available"], "false")
+
+    def test_agent_availability_lambda_payload_structure(self):
+        import agent_availability
+        # Available branch
+        event_avail = {"rawQueryString": "available=true"}
+        res_avail = agent_availability.handler(event_avail, None)
+        self.assertEqual(res_avail["statusCode"], 200)
+        body_avail = json.loads(res_avail["body"])
+        self.assertTrue(body_avail["available"])
+        self.assertEqual(body_avail["agentPhone"], "+15822671755")
+        self.assertEqual(body_avail["agentId"], "agent-001")
+        self.assertEqual(body_avail["agentName"], "Sarah Jenkins")
+        self.assertIn("checkedAt", body_avail)
+
+        # Unavailable branch
+        event_unavail = {"rawQueryString": "available=false"}
+        res_unavail = agent_availability.handler(event_unavail, None)
+        self.assertEqual(res_unavail["statusCode"], 200)
+        body_unavail = json.loads(res_unavail["body"])
+        self.assertFalse(body_unavail["available"])
+        self.assertIsNone(body_unavail["agentPhone"])
+        self.assertIsNone(body_unavail["agentId"])
+        self.assertIsNone(body_unavail["agentName"])
+        self.assertIn("checkedAt", body_unavail)
+
+    @patch("session_context._get_client", side_effect=Exception("No direct lambda"))
+    @patch("urllib.request.urlopen")
+    def test_session_context_fetch_agent_availability_structure(self, mock_urlopen, mock_get_client):
+        from session_context import _fetch_agent_availability
+        # Available mock response
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps({
+            "available": True,
+            "agentPhone": "+15822671755",
+            "agentId": "agent-001",
+            "agentName": "Sarah Jenkins",
+            "checkedAt": "2026-09-02T12:00:00Z",
+        }).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+        mock_urlopen.return_value = mock_resp
+
+        result = _fetch_agent_availability("p1", "e1")
+        self.assertEqual(result["available"], "true")
+        self.assertEqual(result["agentPhone"], "+15822671755")
+        self.assertEqual(result["agentId"], "agent-001")
+        self.assertEqual(result["agentName"], "Sarah Jenkins")
+        self.assertEqual(result["agentCheckedAt"], "2026-09-02T12:00:00Z")
+
+        # Network failure fallback
+        mock_urlopen.side_effect = Exception("Connection refused")
+        fallback_result = _fetch_agent_availability("p2", "e2")
+        self.assertEqual(fallback_result["available"], "false")
+        self.assertEqual(fallback_result["agentId"], "")
+        self.assertEqual(fallback_result["agentName"], "")
+
+
+    # -------------------------------------------------------------
+    # 4. SESSION CONTEXT ATTRIBUTE FORWARDING
+    # -------------------------------------------------------------
+    @patch("session_context.boto3")
+    def test_session_context_attributes(self, mock_boto3):
+        mock_q = MagicMock()
+        mock_boto3.client.return_value = mock_q
+        asst_id = "11111111-1111-4111-8111-111111111111"
+        sess_id = "22222222-2222-4222-8222-222222222222"
+        event = {
+            "Details": {
+                "Parameters": {
+                    "operation": "initialize",
+                    "assistantId": asst_id,
+                    "sessionArn": f"arn:aws:wisdom:us-east-1:123456789012:session/{asst_id}/{sess_id}",
+                    "customerName": "Robert Frost",
+                    "expectedPhone": "+18145550000",
+                    "direct_agent": "yes",
+                    "practiceName": "Cedar Clinic",
+                    "firstName": "Robert",
+                }
+            }
+        }
+        res = session_context.handler(event, None)
+        self.assertEqual(res["contextStatus"], "READY")
+        update_call = mock_q.update_session_data.call_args[1]
+        data_keys = {item["key"]: item["value"]["stringValue"] for item in update_call["data"]}
+        self.assertEqual(data_keys["direct_agent"], "yes")
+        self.assertEqual(data_keys["practiceName"], "Cedar Clinic")
+        self.assertEqual(data_keys["firstName"], "Robert")
+        self.assertEqual(data_keys["identityConfirmed"], "true")
+
+    # -------------------------------------------------------------
+    # 5. DYNAMODB STATUS MATRIX (ALL CALL OUTCOMES)
+    # -------------------------------------------------------------
+    def test_status_transition_matrix(self):
+        outcomes = [
+            # Reason, State, Disp, Expected Status
+            ({"caraEndReason": "refusal"}, "IN_PROGRESS", "Identity Confirmed", "NOT_INTERESTED"),
+            ({"caraEndReason": "do_not_call"}, "IN_PROGRESS", "Identity Confirmed", "NOT_INTERESTED"),
+            ({"caraEndReason": "not_interested"}, "IN_PROGRESS", "Identity Confirmed", "NOT_INTERESTED"),
+            ({}, "NOT_INTERESTED", "Identity Confirmed", "NOT_INTERESTED"),
+            ({}, "IN_PROGRESS", "Call Refused", "NOT_INTERESTED"),
+            ({}, "IN_PROGRESS", "Identity Denied - Refusal", "NOT_INTERESTED"),
+            ({}, "IN_PROGRESS", "Refusal", "NOT_INTERESTED"),
+            ({}, "TRANSFER_COMPLETED", "Identity Confirmed", "COMPLETED"),
+            ({}, "IN_PROGRESS", "Identity Confirmed", "COMPLETED"),
+        ]
+
+        for attrs, state, disp, exp_status in outcomes:
+            with self.subTest(attrs=attrs, state=state, disp=disp):
+                mock_table = MagicMock()
+                patient = {"patientId": "P-STAT", "batchId": "B-STAT", "contactId": "c-stat"}
+                contact = {
+                    "ContactId": "c-stat",
+                    "Attributes": {**attrs, "conversationState": state},
+                }
+                with patch("campaign_dialer._classify_contact", return_value=("Confirmed" if "Confirmed" in disp else "Denied", disp)):
+                    campaign_dialer._finalize_patient(mock_table, patient, contact)
+                    update_kwargs = mock_table.update_item.call_args[1]
+                    vals = update_kwargs["ExpressionAttributeValues"]
+                    status_val = vals.get(":status") or vals.get(":completed")
+                    self.assertEqual(status_val, exp_status)
+                    # Verify condition expression is always present
+                    self.assertEqual(update_kwargs["ConditionExpression"], "#s=:inprogress")
+
+    def test_callback_status_unspecified_vs_scheduled(self):
+        import datetime as dt
+        # Unspecified Callback -> CALLBACK_UNSPECIFIED
+        mock_table = MagicMock()
+        patient = {"patientId": "P-CB1", "batchId": "B-CB1", "contactId": "c-cb1"}
+        plan_unspec = {"requestedBy": "PATIENT", "callbackWhen": "", "callbackReason": "unspecified"}
+        campaign_dialer._finalize_callback_without_schedule(mock_table, patient, plan_unspec, {})
+        update_unspec = mock_table.update_item.call_args[1]
+        self.assertEqual(update_unspec["ExpressionAttributeValues"][":status"], "CALLBACK_UNSPECIFIED")
+        self.assertEqual(update_unspec["ConditionExpression"], "#s=:inprogress")
+
+        # Scheduled Callback -> CALLBACK_SCHEDULED
+        with patch("campaign_dialer._create_callback_schedule", return_value=("sched-1", "2026-09-01T15:00:00Z")):
+            mock_table.reset_mock()
+            cb_time = dt.datetime(2026, 9, 1, 15, 0, 0, tzinfo=dt.timezone.utc)
+            plan_sched = {
+                "requestedBy": "PATIENT",
+                "callbackAt": cb_time,
+                "callbackWhen": "tomorrow at 11am",
+                "disposition": "Callback Requested - Time Specified",
+                "identityResult": "Confirmed",
+            }
+            campaign_dialer._schedule_callback(mock_table, patient, plan_sched, {})
+            update_sched = mock_table.update_item.call_args[1]
+            self.assertEqual(update_sched["ExpressionAttributeValues"][":scheduled"], "CALLBACK_SCHEDULED")
+            self.assertEqual(update_sched["ConditionExpression"], "#s=:inprogress")
+
+    def test_setup_failed_status(self):
+        mock_table = MagicMock()
+        patient = {"patientId": "P-FAIL", "batchId": "B-FAIL"}
+        campaign_dialer._mark_setup_failed(mock_table, patient, reason="Connect rate limit reached")
+        update_fail = mock_table.update_item.call_args[1]
+        self.assertEqual(update_fail["ExpressionAttributeValues"][":failed"], "FAILED")
+        self.assertEqual(update_fail["ExpressionAttributeValues"][":reason"], "Connect rate limit reached")
+        self.assertEqual(update_fail["ConditionExpression"], "#s=:inprogress")
+
+    def test_handle_disconnect_auto_reschedules_unspecified_callback_24h(self):
+        import datetime as dt
+        from zoneinfo import ZoneInfo
+        mock_batches = MagicMock()
+        mock_patients = MagicMock()
+        mock_connect = MagicMock()
+
+        call_start = dt.datetime(2026, 8, 24, 14, 30, 0, tzinfo=dt.timezone.utc)
+        patient = {
+            "patientId": "P-UNSPEC-24H",
+            "batchId": "B-AUTO",
+            "contactId": "c-unspec-24h",
+            "status": "IN_PROGRESS",
+            "callbackCount": 0,
+        }
+        contact = {
+            "ContactId": "c-unspec-24h",
+            "InitiationTimestamp": call_start,
+            "Attributes": {
+                "identityResult": "Confirmed",
+                "identityConfirmed": "true",
+                "conversationState": "CALLBACK",
+                "callbackWhen": "",
+            },
+        }
+        mock_connect.describe_contact.return_value = {"Contact": contact}
+
+        with patch.object(campaign_dialer, "_lookup_by_contact", return_value=patient):
+            with patch.object(campaign_dialer, "_campaign", return_value={"batchId": "B-AUTO", "timezone": "America/New_York", "status": "RUNNING"}):
+                with patch.object(campaign_dialer, "_create_callback_schedule", return_value=("sched-auto-24h", "2026-08-25T14:30:00Z")) as mock_sched:
+                    with patch.object(campaign_dialer, "_start_next_call"):
+                        campaign_dialer._handle_disconnect(mock_batches, mock_patients, mock_connect, "c-unspec-24h", "inst-123")
+
+                        mock_sched.assert_called_once()
+                        expected_cb = call_start.astimezone(ZoneInfo("America/New_York")) + dt.timedelta(hours=24)
+                        self.assertEqual(mock_sched.call_args[0][2], expected_cb)
+
+                        mock_patients.update_item.assert_called_once()
+                        update_vals = mock_patients.update_item.call_args[1]["ExpressionAttributeValues"]
+                        self.assertEqual(update_vals[":scheduled"], "CALLBACK_SCHEDULED")
+                        self.assertEqual(update_vals[":disposition"], "Callback Requested - Auto-Rescheduled (24h)")
+                        self.assertEqual(update_vals[":callbackAt"], expected_cb.isoformat())
+                        self.assertEqual(update_vals[":callbackFor"], "2026-08-25T14:30:00Z")
+                        self.assertEqual(update_vals[":scheduleName"], "sched-auto-24h")
+
+
+if __name__ == "__main__":
+    unittest.main()
+

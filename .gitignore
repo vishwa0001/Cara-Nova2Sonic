@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+*.egg-info/
+
+# Node / frontend build
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Deployment state (account-specific resource IDs)
+deployment-state.json
+deployment_state.json
+cdk.out/
+
+# Build artifacts
+*.zip
+
+# Scratch / debugging output
+scratch/
+call_*_log.json
+raw_events_*.json
+*.log
+logs/
+response.json
+
+# Call recordings (keep the shipped disclosure prompt)
+*.wav
+!backend/assets/*.wav
+
+# Ad-hoc test data
+Cstmr_Calling*.csv
+carascript_dump.txt
+
+# Editors / OS
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.sw?
+
+docs

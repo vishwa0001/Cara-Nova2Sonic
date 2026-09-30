@@ -1,0 +1,35 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "loop-queue-music",
+  "Metadata": {
+    "entryPointPosition": {
+      "x": 40,
+      "y": 40
+    },
+    "ActionMetadata": {
+      "loop-queue-music": {
+        "position": {
+          "x": 200,
+          "y": 40
+        }
+      }
+    }
+  },
+  "Actions": [
+    {
+      "Identifier": "loop-queue-music",
+      "Parameters": {
+        "Messages": [
+          {
+            "PromptId": "${QueueMusicPromptArn}"
+          }
+        ]
+      },
+      "Transitions": {
+        "Errors": [],
+        "Conditions": []
+      },
+      "Type": "MessageParticipantIteratively"
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "Version": "2019-10-30",
+  "StartAction": "loop-hold-music",
+  "Metadata": {
+    "entryPointPosition": {
+      "x": 40,
+      "y": 40
+    },
+    "ActionMetadata": {
+      "loop-hold-music": {
+        "position": {
+          "x": 200,
+          "y": 40
+        }
+      }
+    }
+  },
+  "Actions": [
+    {
+      "Identifier": "loop-hold-music",
+      "Parameters": {
+        "Messages": [
+          {
+            "PromptId": "${HoldMusicPromptArn}"
+          }
+        ]
+      },
+      "Transitions": {
+        "Errors": [],
+        "Conditions": []
+      },
+      "Type": "MessageParticipantIteratively"
+    }
+  ]
+}
