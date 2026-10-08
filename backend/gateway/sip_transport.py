@@ -17,7 +17,8 @@ import logging
 import os
 import struct
 import uuid
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from collections import deque
+from typing import Any, Callable, Deque, Dict, Optional, Set, Tuple
 
 import numpy as np
 from pipecat.frames.frames import (
@@ -30,9 +31,18 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from gateway.agent_answer_detector import HUMAN, AgentAnswerDetector
+from gateway.agent_answer_detector import HUMAN, SILENCE, AgentAnswerDetector
 
 logger = logging.getLogger("sip_transport")
+
+# Caller audio held between the 200 OK and the pipeline being attached
+# (20 ms frames; 150 = 3 s), and the backlog limit once it is attached.
+EARLY_AUDIO_MAX_FRAMES = int(float(os.getenv("CARA_EARLY_AUDIO_MAX_S", "3.0")) * 50)
+INBOUND_QUEUE_MAX_FRAMES = 500
+
+# When to build Cara for an outbound call: "invite" (as soon as we dial),
+# "ringing" (on 180/183) or "answer" (on 200 OK, the old behaviour).
+PREPARE_PIPELINE_AT = os.getenv("CARA_PREPARE_PIPELINE_AT", "invite").lower()
 
 
 # ==============================================================================
@@ -416,6 +426,15 @@ class CallRTPMediaSession:
         # Set while we listen to an agent leg to tell a person from voicemail
         self.answer_detector: Optional[AgentAnswerDetector] = None
         self.answer_verdict: Optional[asyncio.Future] = None
+        # Caller audio only flows to Cara after the 200 OK: before it, the
+        # line carries ringback / carrier early media, never the patient.
+        self.answered = False
+        # Caller frames in arrival order. They wait here (capped) until the
+        # pipeline is attached, so a "hello" right on pickup isn't lost.
+        self._inbound: Deque[bytes] = deque()
+        self._inbound_ready = asyncio.Event()
+        self._pump_task: Optional[asyncio.Task] = None
+        self.early_frames_dropped = 0
 
     async def start(self):
         """Bind dedicated UDP socket for this call."""
@@ -430,8 +449,52 @@ class CallRTPMediaSession:
     def stop(self):
         """Close dedicated UDP socket."""
         self._is_active = False
+        if self._pump_task and not self._pump_task.done():
+            self._pump_task.cancel()
+        self._inbound.clear()
         if self.transport and not self.transport.is_closing():
             self.transport.close()
+
+    def attach_pipeline(self, pipeline_session: Any):
+        """Route caller audio to the pipeline, starting with anything buffered."""
+        self.pipeline_session = pipeline_session
+        if self._inbound:
+            logger.info(
+                f"[EARLY_AUDIO] {len(self._inbound)} caller frames "
+                f"({len(self._inbound) * 20} ms) held since pickup handed to the pipeline "
+                f"for Contact {self.contact_id}"
+            )
+        self._ensure_pump()
+
+    def _ensure_pump(self):
+        if self._pump_task is None or self._pump_task.done():
+            self._pump_task = asyncio.create_task(self._pump_inbound())
+        if self._inbound:
+            self._inbound_ready.set()
+
+    def _queue_caller_audio(self, pcm_8k: bytes):
+        # Before the pipeline is attached keep only the newest few seconds;
+        # once it is attached the cap only guards against a stalled loop.
+        cap = INBOUND_QUEUE_MAX_FRAMES if self.pipeline_session else EARLY_AUDIO_MAX_FRAMES
+        while len(self._inbound) >= cap:
+            self._inbound.popleft()
+            self.early_frames_dropped += 1
+        self._inbound.append(pcm_8k)
+        if self.pipeline_session:
+            self._inbound_ready.set()
+
+    async def _pump_inbound(self):
+        """Deliver caller frames to the pipeline one at a time, in order."""
+        while self._is_active:
+            if not self._inbound or not self.pipeline_session:
+                self._inbound_ready.clear()
+                await self._inbound_ready.wait()
+                continue
+            pcm_8k = self._inbound.popleft()
+            try:
+                await self.pipeline_session.push_audio(pcm_8k)
+            except Exception as e:
+                logger.debug(f"Caller audio delivery note for {self.contact_id}: {e}")
 
     def handle_inbound_rtp(self, data: bytes, addr: Tuple[str, int]):
         """Process incoming RTP packet for this specific call."""
@@ -476,9 +539,8 @@ class CallRTPMediaSession:
             return
 
         # 2. FULL-DUPLEX NOVA CONVERSATIONAL PIPELINE MODE
-        if self.pipeline_session:
-            pcm_8k = ulaw_decode(payload)
-            asyncio.create_task(self.pipeline_session.push_audio(pcm_8k))
+        if self.answered:
+            self._queue_caller_audio(ulaw_decode(payload))
 
     def send_bridged_audio(self, payload: bytes):
         """Relay audio from the bridged peer leg, as its own RTP stream (new SSRC)."""
@@ -580,7 +642,13 @@ class SIPRTPMediaServer:
     def register_session(self, contact_id: str, pipeline_session: Any, remote_addr: Optional[Tuple[str, int]] = None):
         self.active_sessions[contact_id] = pipeline_session
         if contact_id in self.call_sessions:
-            self.call_sessions[contact_id].pipeline_session = pipeline_session
+            self.call_sessions[contact_id].attach_pipeline(pipeline_session)
+
+    def mark_answered(self, contact_id: str):
+        """The far end answered: from now on caller audio is for Cara."""
+        session = self.call_sessions.get(contact_id)
+        if session:
+            session.answered = True
 
     def unregister_session(self, contact_id: str):
         asyncio.create_task(self.close_call_session(contact_id))
@@ -661,6 +729,7 @@ class SIPSignalingServer:
         on_call_started: Optional[Callable[[str, SDPMessage, Tuple[str, int]], Any]] = None,
         on_call_ended: Optional[Callable[[str], Any]] = None,
         on_call_failed: Optional[Callable[..., Any]] = None,
+        on_call_preparing: Optional[Callable[[str, Dict[str, Any]], Any]] = None,
     ):
         self.host = host
         self.port = port
@@ -669,6 +738,8 @@ class SIPSignalingServer:
         self.on_call_started = on_call_started
         self.on_call_ended = on_call_ended
         self.on_call_failed = on_call_failed
+        # Builds Cara for an outbound call before it is answered (see PREPARE_PIPELINE_AT)
+        self.on_call_preparing = on_call_preparing
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.active_dialogs: Dict[str, Dict[str, Any]] = {}
         self._is_running = False
@@ -732,6 +803,8 @@ class SIPSignalingServer:
             elif msg.status_code in (180, 183):
                 dialog["state"] = "RINGING"
                 logger.info(f"[SIP_RESP] {msg.status_code} {msg.reason_phrase} (Ringing) for Call-ID {call_id}")
+                if PREPARE_PIPELINE_AT == "ringing":
+                    self._prepare_pipeline(call_id, dialog)
             elif msg.status_code == 200:
                 logger.info(f"[SIP_RESP] 200 OK (Call Answered) for Call-ID {call_id}")
                 if dialog.get("ring_timeout_task"):
@@ -798,6 +871,8 @@ class SIPSignalingServer:
                         answer_future.set_result(True)
                 elif self.on_call_started and "remote_sdp" in dialog and not dialog.get("pipeline_started"):
                     dialog["pipeline_started"] = True
+                    if self.media_server:
+                        self.media_server.mark_answered(call_id)
                     asyncio.create_task(self.on_call_started(
                         call_id,
                         dialog["remote_sdp"],
@@ -924,7 +999,9 @@ class SIPSignalingServer:
 
         if answered and patient_call_id in self.active_dialogs:
             verdict = await self._screen_agent_answer(agent_call_id, ring_deadline)
-            answered = verdict == HUMAN
+            # A silent pickup is a person waiting for the caller to speak; machines
+            # give a greeting or beep (call 10316d32 hung up on a silent agent)
+            answered = verdict in (HUMAN, SILENCE)
 
         if answered and patient_call_id in self.active_dialogs and self.media_server:
             if self.media_server.bridge_calls(patient_call_id, agent_call_id):
@@ -1090,8 +1167,22 @@ class SIPSignalingServer:
         dialog["ring_timeout_task"] = asyncio.create_task(
             self._ring_timeout_watchdog(call_id)
         )
+        if PREPARE_PIPELINE_AT == "invite":
+            self._prepare_pipeline(call_id, dialog)
 
         return call_id
+
+    def _prepare_pipeline(self, call_id: str, dialog: Dict[str, Any]):
+        """Build Cara and open Nova while the phone rings, so both are ready at
+        pickup. Patient legs only; an unanswered call tears it down again."""
+        if (
+            not self.on_call_preparing
+            or "answer_future" in dialog
+            or dialog.get("pipeline_preparing")
+        ):
+            return
+        dialog["pipeline_preparing"] = True
+        asyncio.create_task(self.on_call_preparing(call_id, dialog.get("patient_meta", {})))
 
     async def _ring_timeout_watchdog(self, call_id: str):
         """
@@ -1353,6 +1444,8 @@ class SIPSignalingServer:
             self.transport.sendto(ok_resp, addr)
             logger.info(f"[SIP] Sent 200 OK with dynamic local RTP port {local_rtp_port} to {addr} for Call-ID {call_id}")
 
+        if self.media_server:
+            self.media_server.mark_answered(call_id)
         if self.on_call_started:
             await self.on_call_started(call_id, remote_sdp, remote_rtp_addr)
 

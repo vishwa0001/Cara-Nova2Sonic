@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import logging
 import os
@@ -402,7 +403,9 @@ class OutreachRecordService:
         """Record the call start timestamp when call is answered (200 OK)."""
         now = utc_now_iso()
         try:
-            self._table.update_item(
+            # Runs at pickup, on the live call's event loop: keep the network call off it
+            await asyncio.to_thread(
+                self._table.update_item,
                 Key={"patient_id": patient_id},
                 UpdateExpression="SET call_start_datetime = :cs, last_call_id = :c, last_updated_at = :ts",
                 ExpressionAttributeValues={":cs": now, ":c": call_id, ":ts": now},

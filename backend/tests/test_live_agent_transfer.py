@@ -112,6 +112,22 @@ class BridgeTests(unittest.TestCase):
         self.assertIsNone(media.call_sessions[PATIENT].bridge_peer)
         send_bye.assert_awaited_once_with("agent-leg")
 
+    def test_silent_agent_pickup_is_bridged(self):
+        # Call 10316d32: the agent picked up and waited quietly; we hung up on them
+        sig, media = _server()
+
+        async def main():
+            with patch.object(sig, "originate_call", side_effect=_fake_originate(sig, media, True)), \
+                    patch.object(sig, "_screen_agent_answer", new=_screen("SILENCE")), \
+                    patch.object(sig, "send_bye", new=AsyncMock()) as send_bye:
+                ok = await sig.dial_agent_and_bridge(PATIENT, AGENT_PHONE)
+                return ok, send_bye
+
+        ok, send_bye = asyncio.run(main())
+        self.assertTrue(ok)
+        self.assertIsNotNone(media.call_sessions[PATIENT].bridge_peer)
+        send_bye.assert_not_awaited()
+
     def test_rejected_invite_is_acked(self):
         sig, media = _server()
         sig.handle_inbound_sip(
@@ -191,6 +207,12 @@ class BridgeTests(unittest.TestCase):
 
 
 class NovaTransferTests(unittest.TestCase):
+    def setUp(self):
+        synth = patch.object(nova_sonic_service, "_synthesize_forced_closing_helper",
+                             AsyncMock(return_value=b"hold-audio"))
+        self.synth = synth.start()
+        self.addCleanup(synth.stop)
+
     def _session(self, answered):
         s = NovaSonicSession(MagicMock(), contact_id=PATIENT, on_hangup=AsyncMock(),
                              on_forced_audio=AsyncMock(), on_transfer=AsyncMock(return_value=answered),
@@ -249,8 +271,31 @@ class NovaTransferTests(unittest.TestCase):
 
         asyncio.run(main())
         s._send_tool_result.assert_not_awaited()  # held until the agent answers or not
-        s._run_transfer.assert_awaited_once_with("tool-1", AGENT_PHONE)
+        s._run_transfer.assert_awaited_once_with("tool-1", AGENT_PHONE, spoken_text="")
         self.assertTrue(s._transfer_pending)
+
+    def test_hold_line_played_when_nova_skipped_it(self):
+        # Calls 9af65a8d / 60364398: tool called straight after "yes", patient heard silence
+        s = self._session(False)
+        s._send_tool_result = AsyncMock()
+        asyncio.run(s._run_transfer("tool-1", AGENT_PHONE, spoken_text=""))
+        self.assertIn("Please hold", self.synth.call_args[0][0])
+        s.on_forced_audio.assert_awaited_once_with(b"hold-audio")
+        s.on_transfer.assert_awaited_once_with(AGENT_PHONE)
+
+    def test_hold_line_not_repeated_when_nova_said_it(self):
+        s = self._session(True)
+        asyncio.run(s._run_transfer("tool-1", AGENT_PHONE,
+                                    spoken_text="Please hold while I connect you now."))
+        self.synth.assert_not_awaited()
+        s.on_forced_audio.assert_not_awaited()
+
+    def test_transfer_still_dials_when_hold_line_fails(self):
+        self.synth.side_effect = RuntimeError("polly down")
+        s = self._session(True)
+        asyncio.run(s._run_transfer("tool-1", AGENT_PHONE))
+        s.on_transfer.assert_awaited_once_with(AGENT_PHONE)
+        self.assertEqual(s.final_disposition, "TRANSFERRED")
 
     def test_direct_call_switches_to_normal_once_then_offers_callback(self):
         from backend.domain_rules import CallMode, PatientContext
@@ -263,6 +308,24 @@ class NovaTransferTests(unittest.TestCase):
         # second missed transfer on the same call: normal callback branch
         asyncio.run(s._run_transfer("tool-2", AGENT_PHONE))
         self.assertEqual(s._send_tool_result.call_args[0][2]["status"], "agent_no_answer")
+
+    def test_direct_call_already_in_normal_script_gets_plain_no_answer(self):
+        # Call 10316d32: Cara ran the identity check on a direct call; "switch to
+        # normal" then left her saying "please hold" and going silent
+        from backend.domain_rules import CallMode, PatientContext
+        s = self._session(False)
+        s.patient = PatientContext(patient_id="p1", first_name="Tim", last_name="Cook",
+                                   practice_name="X", call_mode=CallMode.MODE_1_DIRECT_HANDOFF)
+        s._normal_script_spoken = True
+        s._send_tool_result = AsyncMock()
+        asyncio.run(s._run_transfer("tool-1", AGENT_PHONE))
+        self.assertEqual(s._send_tool_result.call_args[0][2]["status"], "agent_no_answer")
+
+    def test_normal_script_lines_are_noticed(self):
+        self.assertTrue(any(m in "hi, this is cara. am i able to speak with tim cook?"
+                            for m in nova_sonic_service._NORMAL_SCRIPT_MARKERS))
+        direct_line = "hi tim, x has some important information to share with you. please hold while i connect you now."
+        self.assertFalse(any(m in direct_line for m in nova_sonic_service._NORMAL_SCRIPT_MARKERS))
 
     def test_callback_closing_without_tool_is_booked_by_gateway(self):
         s = self._session(False)

@@ -14,7 +14,7 @@ import logging
 import os
 import re
 from typing import Any, Dict, List, Tuple
-from urllib.parse import unquote_plus
+from urllib.parse import unquote, unquote_plus
 
 import boto3
 from botocore.exceptions import ClientError
@@ -320,7 +320,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 or metadata.get("x-amz-meta-scheduled-time")
                 or utc_now_iso()
             )
-            source_filename = (
+            # campaign_api signs the filename URL-encoded.
+            source_filename = unquote(
                 metadata.get("original-filename")
                 or metadata.get("original_filename")
                 or metadata.get("x-amz-meta-original-filename")

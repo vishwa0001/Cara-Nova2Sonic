@@ -17,9 +17,9 @@ from backend.gateway.tools import OutreachToolExecutor
 import campaign_dialer
 
 
-def _executor(ui_phone):
+def _executor(ui_phone, patient_phone="+15822671755"):
     patient = PatientContext(patient_id="p1", first_name="Tim", last_name="Cook",
-                             practice_name="X", human_agent_phone=ui_phone)
+                             practice_name="X", human_agent_phone=ui_phone, phone_number=patient_phone)
     storage = MagicMock()
     return OutreachToolExecutor(api_base_url="http://mock", storage_service=storage,
                                 connect_client=MagicMock(), patient_context=patient, contact_id="c1")
@@ -50,6 +50,18 @@ class AgentPhonePriorityTests(unittest.TestCase):
         with patch.dict(os.environ, {"FIXED_AGENT_PHONE": "+12132960390"}):
             res = _run(_executor(""), {"available": True})
         self.assertEqual(res["agent_phone"], "+12132960390")
+
+    def test_agent_number_equal_to_patient_phone_is_skipped(self):
+        # Call 9af65a8d: patient and agent were the same handset, so the agent leg rang out
+        res = _run(_executor("+12525000184", patient_phone="+1 (252) 500-0184"),
+                   {"available": True, "agentPhone": "+13105550000"})
+        self.assertEqual(res["agent_phone"], "+13105550000")
+
+    def test_no_dial_when_every_agent_number_is_the_patient(self):
+        with patch.dict(os.environ, {"FIXED_AGENT_PHONE": "+12525000184"}):
+            res = _run(_executor("+12525000184", patient_phone="+12525000184"), {"available": True})
+        self.assertEqual(res["status"], "unavailable")
+        self.assertIsNone(res["agent_phone"])
 
     def test_dialer_forwards_ui_number(self):
         with patch("urllib.request.urlopen") as urlopen:

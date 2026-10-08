@@ -16,7 +16,9 @@ import logging
 import os
 import signal
 import sys
-from typing import Any, Dict, Optional, Set, Tuple
+import time
+from collections import deque
+from typing import Any, Deque, Dict, Optional, Set, Tuple
 
 import boto3
 from botocore.exceptions import ClientError, ProfileNotFound
@@ -28,10 +30,17 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 
-from domain_rules import CallMode, PatientContext
+from domain_rules import CALL_CONNECTED_CUE, SCRIPT_DEFINITIONS, CallMode, PatientContext
+from gateway.caller_speech import CallerSpeechDetector, load_vad_model
 from gateway.kvs_transport import KVSInputProcessor, KVSOutputProcessor
 from gateway.nova_sonic_service import NovaSonicLLMService
-from gateway.sip_transport import SDPMessage, SIPRTPMediaServer, SIPRTPOutputProcessor, SIPSignalingServer
+from gateway.sip_transport import (
+    EARLY_AUDIO_MAX_FRAMES,
+    SDPMessage,
+    SIPRTPMediaServer,
+    SIPRTPOutputProcessor,
+    SIPSignalingServer,
+)
 from gateway.tools import OutreachToolExecutor
 from storage.outreach_records import (
     RETRYABLE_CALL_OUTCOMES,
@@ -52,6 +61,29 @@ DEFAULT_PROFILE = os.getenv("AWS_PROFILE", "careharmony")
 DEFAULT_RTP_PORT = int(os.getenv("RTP_PORT", "10000"))
 DEFAULT_SIP_PORT = int(os.getenv("SIP_PORT", "5060"))
 DEFAULT_CONNECT_INSTANCE = os.getenv("CONNECT_INSTANCE_ID", "8e7c7423-5e98-44ab-a748-b3ca0bd7a896")
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Cara opens the call herself when the caller stays quiet after the disclosure.
+# Long speech is never treated as voicemail here; only the beep or voicemail
+# phrases in the transcript end a call (see NovaSonicSession).
+OPENING_ENABLED = os.getenv("CARA_OPENING_ENABLED", "true").lower() == "true"
+# Off: Cara's opening line is played through Polly. On: Nova is sent a text
+# cue instead (a mid-stream text block has hung Nova before, so test first).
+OPENING_CUE_ENABLED = os.getenv("CARA_OPENING_CUE_ENABLED", "false").lower() == "true"
+OPENING_SILENCE_S = _env_float("CARA_OPENING_SILENCE_S", 1.5)
+OPENING_AFTER_SPEECH_S = _env_float("CARA_OPENING_AFTER_SPEECH_S", 2.5)
+OPENING_CAP_S = _env_float("CARA_OPENING_CAP_S", 3.0)
+OPENING_CAP_PAUSE_S = _env_float("CARA_OPENING_CAP_PAUSE_S", 0.3)
+OPENING_POLL_S = 0.05
+# Silence fed to Nova while the phone rings (100 ms of 8 kHz PCM16)
+RINGING_SILENCE_FRAME = b"\x00" * 1600
 
 _polly_client = None
 
@@ -189,10 +221,23 @@ class CaraVoicePipeline:
         sip_signaling_server: Optional[SIPSignalingServer] = None,
         remote_rtp_addr: Optional[Tuple[str, int]] = None,
         invite_headers: Optional[Dict[str, str]] = None,
+        answered: bool = True,
     ):
         self.call_id = call_id
         self.campaign_id = campaign_id
         self.media_server = media_server
+        self._is_running = False
+        self._stopped = False
+        # False while the phone is still ringing (pipeline built before pickup)
+        self._answered = answered
+        self._answered_event = asyncio.Event()
+        if answered:
+            self._answered_event.set()
+        # Caller frames that arrive before run() starts delivering them
+        self._early_audio: Deque[bytes] = deque(maxlen=EARLY_AUDIO_MAX_FRAMES)
+        self.caller_speech = CallerSpeechDetector()
+        self._listening_for_opening = True
+        self._opening_audio_task: Optional[asyncio.Task] = None
         self.sip_signaling_server = sip_signaling_server or globals().get("sip_signaling_server")
         self.invite_headers = invite_headers or {}
 
@@ -287,6 +332,15 @@ class CaraVoicePipeline:
             else:
                 logger.warning(f"[FORCED_AUDIO_DROPPED] No sip_output_processor queue for {self.call_id}")
 
+        self._on_forced_audio = _on_forced_audio
+
+        def _purge_output():
+            """Drop audio queued for the caller (voicemail message start / cancel)."""
+            output = getattr(self, "sip_output_processor", None)
+            if output:
+                output.purge_queue()
+                output._interrupted.clear()  # nothing to drop: keep the next frame
+
         self.input_processor = KVSInputProcessor(target_sample_rate=16000)
         self.nova_sonic = NovaSonicLLMService(
             patient_context=self.patient,
@@ -295,6 +349,7 @@ class CaraVoicePipeline:
             on_forced_audio=_on_forced_audio,
             on_transfer=_on_cara_transfer,
             tool_executor=self.tool_executor,
+            on_purge_output=_purge_output,
         )
         self.nova_sonic_session = getattr(self.nova_sonic, "session", None)
         if self.nova_sonic_session:
@@ -342,7 +397,112 @@ class CaraVoicePipeline:
             except TypeError:
                 self.task = PipelineTask(self.pipeline)
         self.runner = PipelineRunner()
-        self._is_running = False
+
+    def mark_answered(self):
+        """The patient's phone was answered: start the disclosure and caller audio."""
+        self._answered = True
+        self._answered_event.set()
+
+    async def _feed_silence_until_answered(self):
+        """Keep the Nova stream fed while the phone rings. The line carries
+        ringback then, never the patient, so real audio is not forwarded."""
+        while not self._answered_event.is_set():
+            await self.task.queue_frame(
+                AudioRawFrame(audio=RINGING_SILENCE_FRAME, sample_rate=8000, num_channels=1)
+            )
+            try:
+                await asyncio.wait_for(self._answered_event.wait(), timeout=0.1)
+            except asyncio.TimeoutError:
+                pass
+
+    async def _start_caller_audio(self):
+        """Deliver caller audio held since pickup, oldest first, then go live."""
+        held = len(self._early_audio)
+        while self._early_audio:
+            await self._queue_caller_frame(self._early_audio.popleft())
+        self._is_running = True
+        if held:
+            logger.info(f"[EARLY_AUDIO] Sent {held} held caller frames ({held * 20} ms) to Nova for {self.call_id}")
+
+    async def _queue_caller_frame(self, audio_chunk: bytes):
+        frame = AudioRawFrame(audio=audio_chunk, sample_rate=8000, num_channels=1)
+        try:
+            await self.task.queue_frame(frame)
+        except Exception as ex:
+            logger.debug(f"Audio push frame exception: {ex}")
+
+    def _uses_forced_opening(self) -> bool:
+        """Polly plays the opening line when the Nova text cue is off. A direct
+        handoff call keeps today's behaviour: its line must trigger the transfer tool."""
+        return (
+            OPENING_ENABLED
+            and not OPENING_CUE_ENABLED
+            and self.sip_output_processor is not None
+            and self.patient is not None
+            and self.patient.call_mode != CallMode.MODE_1_DIRECT_HANDOFF
+        )
+
+    def _opening_text(self) -> str:
+        return self.patient.render_template(SCRIPT_DEFINITIONS.opening_greeting)
+
+    async def _synthesize_opening(self) -> Optional[bytes]:
+        try:
+            return await synthesize_forced_closing(self._opening_text())
+        except Exception:
+            logger.exception(f"[OPENING] Could not synthesize the opening line for {self.call_id}")
+            return None
+
+    async def _open_if_caller_silent(self, disclosure_end: float):
+        """After the disclosure, open the call if the caller doesn't speak.
+
+        Caller speech only delays the decision (Nova answers it as today); it
+        never ends the call. The cap makes sure the line is never left silent.
+        """
+        speech = self.caller_speech
+        try:
+            while not self._stopped:
+                await asyncio.sleep(OPENING_POLL_S)
+                session = self.nova_sonic.session
+                if not session or not session.awaiting_opening():
+                    return
+                if speech.speaking:
+                    continue
+                now = time.monotonic()
+                quiet = speech.quiet_for(now, since=disclosure_end)
+                reason = None
+                if speech.last_speech_at is None and quiet >= OPENING_SILENCE_S:
+                    reason = f"no caller speech for {quiet:.1f}s after the disclosure"
+                elif speech.last_speech_at is not None and quiet >= OPENING_AFTER_SPEECH_S:
+                    reason = f"no reply {quiet:.1f}s after the caller last spoke"
+                elif now - disclosure_end >= OPENING_CAP_S and quiet >= OPENING_CAP_PAUSE_S:
+                    reason = f"{OPENING_CAP_S:.1f}s cap after the disclosure"
+                if reason:
+                    await self._start_opening(session, reason)
+                    return
+        finally:
+            self._listening_for_opening = False
+
+    async def _start_opening(self, session, reason: str):
+        if self.patient is not None and self.patient.call_mode == CallMode.MODE_1_DIRECT_HANDOFF:
+            # Nova answered the cue with the normal opening instead of the
+            # direct line (call 60364398); the direct line follows the hello
+            logger.info(f"[OPENING] {reason} for {self.call_id} — direct handoff call, waiting for the caller")
+            return
+        if OPENING_CUE_ENABLED:
+            logger.info(f"[OPENING] {reason} for {self.call_id} — cueing Nova Sonic to open the call")
+            await session.send_opening_cue(CALL_CONNECTED_CUE)
+            return
+        if not self._uses_forced_opening():
+            return
+        try:
+            audio = await self._opening_audio_task if self._opening_audio_task else None
+        except asyncio.CancelledError:
+            return  # call ended while the line was being synthesized
+        if not audio or not session.awaiting_opening():
+            return
+        logger.info(f"[OPENING] {reason} for {self.call_id} — playing Cara's opening line")
+        session.note_forced_opening(self._opening_text(), len(audio) / 8000.0)
+        await self._on_forced_audio(audio)
 
     async def _play_opening_disclosure(self):
         """
@@ -380,15 +540,35 @@ class CaraVoicePipeline:
 
     async def run(self):
         """Execute the pipeline loop."""
-        self._is_running = True
         logger.info(f"Starting Cara Voice Pipeline for call {self.call_id} (Patient {self.patient.patient_id})")
-        
-        # Start pipeline runner in a background task
+
+        # Start pipeline runner in a background task; this opens Nova Sonic
         runner_task = asyncio.create_task(self.runner.run(self.task))
+        if self._uses_forced_opening():
+            self._opening_audio_task = asyncio.create_task(self._synthesize_opening())
 
-        # Play mandatory opening disclosure
+        if not self._answered_event.is_set():
+            logger.info(f"[PREPARE] Pipeline for {self.call_id} is up before pickup; waiting for the answer")
+            await self._feed_silence_until_answered()
+            if self._stopped:
+                await self._finish(runner_task)
+                return
+            logger.info(f"[PREPARE] {self.call_id} answered; pipeline already running")
+
+        await self._start_caller_audio()
+
+        # Play mandatory opening disclosure; its echo must not count as the caller
+        self.caller_speech.set_muted(True)
         await self._play_opening_disclosure()
+        self.caller_speech.set_muted(False)
+        if OPENING_ENABLED and self.sip_output_processor is not None and not self._stopped:
+            asyncio.create_task(self._open_if_caller_silent(time.monotonic()))
+        else:
+            self._listening_for_opening = False
 
+        await self._finish(runner_task)
+
+    async def _finish(self, runner_task: asyncio.Task):
         try:
             await runner_task
         except Exception as e:
@@ -396,17 +576,26 @@ class CaraVoicePipeline:
 
     async def push_audio(self, audio_chunk: bytes):
         """Feed inbound telephony audio from SIP/RTP or KVS into the Pipecat pipeline."""
-        if self._is_running and audio_chunk:
-            logger.info(f"[AUDIO_IN] Ingested audio frame ({len(audio_chunk)} bytes) for Contact {self.call_id}")
-            frame = AudioRawFrame(audio=audio_chunk, sample_rate=8000, num_channels=1)
-            try:
-                await self.task.queue_frame(frame)
-            except Exception as ex:
-                logger.debug(f"Audio push frame exception: {ex}")
+        if not audio_chunk or self._stopped:
+            return
+        if self._listening_for_opening:
+            self.caller_speech.feed(audio_chunk, time.monotonic())
+        if not self._is_running:
+            self._early_audio.append(audio_chunk)
+            return
+        logger.info(f"[AUDIO_IN] Ingested audio frame ({len(audio_chunk)} bytes) for Contact {self.call_id}")
+        await self._queue_caller_frame(audio_chunk)
 
     async def stop(self):
         """Cancel and terminate the pipeline and persist final call outcome to DynamoDB."""
         self._is_running = False
+        self._stopped = True
+        answered_event = getattr(self, "_answered_event", None)
+        if answered_event:
+            answered_event.set()  # releases run() if the phone was still ringing
+        opening_audio = getattr(self, "_opening_audio_task", None)
+        if opening_audio and not opening_audio.done():
+            opening_audio.cancel()
         if self.media_server:
             self.media_server.unregister_session(self.call_id)
         try:
@@ -419,6 +608,12 @@ class CaraVoicePipeline:
                 await sig_server.send_bye(self.call_id)
         except Exception:
             pass
+
+        if not getattr(self, "_answered", True):
+            # Built while ringing and never answered: the SIP layer already
+            # recorded the failure (busy / no answer) and queued the retry.
+            logger.info(f"[PREPARE] {self.call_id} was never answered; pipeline torn down")
+            return
 
         # Persist the final outcome. No-contact outcomes (and a patient hanging
         # up mid-conversation) are queued for a retry; a callback the patient
@@ -513,6 +708,7 @@ class KVSStreamConsumerWorker:
         invite_headers: Optional[Dict[str, str]] = None,
         human_agent_phone: str = "",
         timezone: str = "",
+        answered: bool = True,
     ) -> CaraVoicePipeline:
         """Instantiate and start a new CaraVoicePipeline for an active contact."""
         if contact_id in self.active_sessions:
@@ -560,6 +756,7 @@ class KVSStreamConsumerWorker:
             sip_signaling_server=self.sip_signaling_server or globals().get("sip_signaling_server"),
             remote_rtp_addr=remote_rtp_addr,
             invite_headers=invite_headers,
+            answered=answered,
         )
         self.active_sessions[contact_id] = pipeline
         asyncio.create_task(pipeline.run())
@@ -658,51 +855,88 @@ rtp_media_server: Optional[SIPRTPMediaServer] = None
 sip_signaling_server: Optional[SIPSignalingServer] = None
 
 
+def _session_args(call_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    """create_session() arguments from the patient details given at dial time."""
+    return {
+        "contact_id": call_id,
+        "patient_id": meta.get("patient_id") or meta.get("empi") or f"P-{call_id[:8]}",
+        "first_name": meta.get("first_name", ""),
+        "last_name": meta.get("last_name", ""),
+        "practice_name": meta.get("practice_name", "Metro Health Clinic"),
+        "call_mode": meta.get("call_mode", "MODE_2_NORMAL_COACHING"),
+        "callback_number": meta.get("practice_callback_number", ""),
+        "provider_name": meta.get("provider_name", ""),
+        "human_agent_phone": meta.get("human_agent_phone", ""),
+        "timezone": meta.get("timezone", ""),
+    }
+
+
+# Outbound calls whose pipeline is still being built before pickup
+_preparing_calls: Dict[str, asyncio.Task] = {}
+
+
+async def handle_sip_call_preparing(call_id: str, patient_meta: Optional[Dict[str, Any]] = None):
+    """Build Cara and open Nova Sonic while the patient's phone rings.
+
+    Both are then ready the moment the call is answered, instead of taking
+    about a second after pickup while the caller's first words were lost.
+    """
+    global worker
+    if not worker:
+        return
+    _preparing_calls[call_id] = asyncio.current_task()
+    try:
+        await worker.create_session(answered=False, **_session_args(call_id, patient_meta or {}))
+    except Exception:
+        logger.exception(f"[PREPARE] Could not build the pipeline early for {call_id}; it will be built at pickup")
+        return
+    finally:
+        _preparing_calls.pop(call_id, None)
+
+    if sip_signaling_server and call_id not in sip_signaling_server.active_dialogs:
+        # The call failed while the pipeline was being built
+        session = worker.active_sessions.pop(call_id, None)
+        if session:
+            await session.stop()
+
+
+async def _record_call_started(patient_id: str, call_id: str):
+    try:
+        storage = await asyncio.to_thread(OutreachRecordService)
+        await storage.mark_call_started(patient_id=patient_id, call_id=call_id)
+    except Exception as e:
+        logger.warning(f"mark_call_started error for {patient_id}: {e}")
+
+
 async def handle_sip_call_started(
     call_id: str,
     remote_sdp: SDPMessage,
     remote_rtp_addr: Tuple[str, int],
     patient_meta: Optional[Dict[str, Any]] = None,
 ):
-    """Callback when an inbound SIP INVITE is accepted and remote RTP is negotiated."""
+    """Callback when the call is answered (outbound 200 OK, or an inbound INVITE we accepted)."""
     global worker
-    if worker:
-        meta = patient_meta or {}
-        patient_id = meta.get("patient_id") or meta.get("empi") or f"P-{call_id[:8]}"
-        first_name = meta.get("first_name", "")
-        last_name = meta.get("last_name", "")
-        practice_name = meta.get("practice_name", "Metro Health Clinic")
-        call_mode = meta.get("call_mode", "MODE_2_NORMAL_COACHING")
-        practice_callback_number = meta.get("practice_callback_number", "")
-        provider_name = meta.get("provider_name", "")
-        human_agent_phone = meta.get("human_agent_phone", "")
-        campaign_timezone = meta.get("timezone", "")
+    if not worker:
+        return
+    args = _session_args(call_id, patient_meta or {})
+    preparing = _preparing_calls.get(call_id)
+    if preparing:
+        await asyncio.wait([preparing])  # answered while still being built
+
+    pipeline = worker.active_sessions.get(call_id)
+    if pipeline is None:
         logger.info(
             f"[SIP_CALL] Initiating CaraVoicePipeline for Call-ID {call_id} -> Remote RTP {remote_rtp_addr} "
-            f"(Patient ID: {patient_id}, Patient: {first_name} {last_name}, Practice: {practice_name})"
+            f"(Patient ID: {args['patient_id']}, Patient: {args['first_name']} {args['last_name']}, "
+            f"Practice: {args['practice_name']})"
         )
-        try:
-            storage = OutreachRecordService()
-            await storage.mark_call_started(
-                patient_id=patient_id,
-                call_id=call_id,
-            )
-        except Exception as e:
-            logger.warning(f"mark_call_started error for {patient_id}: {e}")
+        pipeline = await worker.create_session(remote_rtp_addr=remote_rtp_addr, **args)
+    else:
+        logger.info(f"[SIP_CALL] {call_id} answered; using the pipeline built while ringing")
+    pipeline.mark_answered()
 
-        await worker.create_session(
-            contact_id=call_id,
-            patient_id=patient_id,
-            first_name=first_name,
-            last_name=last_name,
-            practice_name=practice_name,
-            call_mode=call_mode,
-            callback_number=practice_callback_number,
-            provider_name=provider_name,
-            remote_rtp_addr=remote_rtp_addr,
-            human_agent_phone=human_agent_phone,
-            timezone=campaign_timezone,
-        )
+    # Off the critical path: the database write must not delay the disclosure
+    asyncio.create_task(_record_call_started(args["patient_id"], call_id))
 
 
 async def handle_sip_call_ended(call_id: str):
@@ -717,9 +951,9 @@ async def handle_sip_call_ended(call_id: str):
 
 async def _on_call_failed(call_id: str, patient_id: str, reason: str, sip_code: Optional[int] = None):
     """
-    Fires when an outbound call never connects. No
-    CaraVoicePipeline session exists for this call_id (only
-    created on 200 OK), so update DynamoDB directly.
+    Fires when an outbound call never connects. Any pipeline built
+    while it rang is torn down without recording an outcome (see
+    CaraVoicePipeline.stop), so update DynamoDB directly.
     """
     logger.info(
         f"[PIPELINE_CALL_FAILED] call_id={call_id} "
@@ -749,6 +983,17 @@ async def _on_call_failed(call_id: str, patient_id: str, reason: str, sip_code: 
 @app.on_event("startup")
 async def startup_event():
     global worker, rtp_media_server, sip_signaling_server
+    # Load the caller speech model and the Polly client once, before any call needs them
+    await asyncio.to_thread(load_vad_model)
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo("Asia/Kolkata")
+    except Exception:
+        logger.error("[STARTUP] No timezone data in this image: callback times will be read in UTC")
+    try:
+        await asyncio.to_thread(_get_polly_client)
+    except Exception as e:
+        logger.warning(f"Polly client not ready at startup: {e}")
     # 1. Start SIP/RTP Media Server (Port 10000)
     rtp_media_server = SIPRTPMediaServer(
         host="0.0.0.0",
@@ -766,6 +1011,7 @@ async def startup_event():
         on_call_started=handle_sip_call_started,
         on_call_ended=handle_sip_call_ended,
         on_call_failed=_on_call_failed,
+        on_call_preparing=handle_sip_call_preparing,
     )
     sip_signaling_server.on_call_failed = _on_call_failed
     await sip_signaling_server.start()

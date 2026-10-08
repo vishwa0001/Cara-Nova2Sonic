@@ -127,6 +127,15 @@ def _day_offset(t: str, local_now: datetime) -> Optional[int]:
     return None
 
 
+def names_a_time(text: Optional[str]) -> bool:
+    """True when the words give a day or time ("day after tomorrow", "at 3 pm", "in 10 minutes")."""
+    t = _normalize(text or "")
+    if not t or t in _UNSPECIFIED:
+        return False
+    local_now = datetime.now(timezone.utc)
+    return _relative(t) is not None or _day_offset(t, local_now) is not None or _clock_time(t) is not None
+
+
 def parse_reschedule_time(
     preferred_time: Optional[str],
     now: Optional[datetime] = None,

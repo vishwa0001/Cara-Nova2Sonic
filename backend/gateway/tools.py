@@ -21,9 +21,9 @@ import re
 from datetime import datetime, timedelta, timezone
 
 try:
-    from gateway.reschedule_time import parse_reschedule_time  # noqa: F401 (used by reschedule_call)
+    from gateway.reschedule_time import names_a_time, parse_reschedule_time
 except ImportError:
-    from backend.gateway.reschedule_time import parse_reschedule_time  # noqa: F401
+    from backend.gateway.reschedule_time import names_a_time, parse_reschedule_time
 
 try:
     from domain_rules import (
@@ -63,6 +63,21 @@ DISPOSITION_SCRIPT_MARKERS = [
     ("i'll need to speak directly with", "IDENTITY_UNCONFIRMED"),
     ("try reaching them another time", "IDENTITY_UNCONFIRMED"),
 ]
+
+def _phone_digits(phone: Optional[str]) -> str:
+    """Last 10 digits, so "+1 252-500-0184" and "2525000184" compare equal."""
+    return re.sub(r"\D", "", phone or "")[-10:]
+
+
+def _pick_agent_phone(candidates: List[Optional[str]], patient_phone: Optional[str]) -> Optional[str]:
+    """First agent number that isn't the patient's own phone. That phone is
+    busy with Cara's call, so the agent leg just rings out (call 9af65a8d)."""
+    patient = _phone_digits(patient_phone)
+    for phone in candidates:
+        if phone and (not patient or _phone_digits(phone) != patient):
+            return phone
+    return None
+
 
 def infer_disposition_from_speech(last_spoken_text: str) -> Optional[str]:
     """
@@ -245,15 +260,25 @@ class OutreachToolExecutor:
             avail_data = {"available": False}
 
         is_available = bool(avail_data.get("available"))
-
-        # 2. Branch: Available
+        agent_phone = None
         if is_available:
             # UI "Human Agent Phone" > availability API agentPhone > FIXED_AGENT_PHONE
-            agent_phone = (
-                (self.patient.human_agent_phone if self.patient else "")
-                or avail_data.get("agentPhone")
-                or os.environ.get("FIXED_AGENT_PHONE", "+15822671755")
+            agent_phone = _pick_agent_phone(
+                [
+                    self.patient.human_agent_phone if self.patient else "",
+                    avail_data.get("agentPhone"),
+                    os.environ.get("FIXED_AGENT_PHONE", "+15822671755"),
+                ],
+                patient_phone=active_patient_phone,
             )
+            if not agent_phone:
+                logger.warning(
+                    f"[TRANSFER_SAME_PHONE] Every agent number is the patient's own phone for {active_call_id}; "
+                    f"not dialing it"
+                )
+
+        # 2. Branch: Available
+        if agent_phone:
             agent_id = avail_data.get("agentId", "agent-001")
             agent_name = avail_data.get("agentName", "Sarah Jenkins")
             assigned_agent = {
@@ -329,10 +354,16 @@ class OutreachToolExecutor:
         patient_id: Optional[str] = None,
         call_id: Optional[str] = None,
         requested_time: Optional[str] = None,
+        caller_words: str = "",
         **kwargs,
     ) -> Dict[str, Any]:
         """Handle patient callback agreement, increment reschedule_count, and persist next scheduled_time."""
         target_time = requested_time or preferred_time
+        # Nova rewords the request: "day after tomorrow" arrived as "after
+        # tomorrow" (call 8e29df6f). The caller's own words win when they name a time.
+        if caller_words and names_a_time(caller_words) and caller_words.strip() != (target_time or "").strip():
+            logger.info(f"[RESCHEDULE] Using the caller's words {caller_words!r} over the tool's {target_time!r}")
+            target_time = caller_words
         scheduled_dt = parse_reschedule_time(
             target_time, tz_name=(self.patient.timezone if self.patient else None)
         )

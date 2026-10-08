@@ -8,6 +8,8 @@ httpx>=0.27.0
 scipy>=1.12.0
 numpy>=1.26.0
 pydantic>=2.6.0
+# zoneinfo data: python:3.12-slim has none, so every campaign timezone fell back to UTC
+tzdata>=2024.1
 aws-sdk-bedrock-runtime>=0.11.0
 awscrt>=0.37.0
 aws-credentials-http>=0.1.0

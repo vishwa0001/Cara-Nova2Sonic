@@ -14,6 +14,7 @@ import logging
 import os
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+from urllib.parse import quote
 
 import boto3
 from botocore.config import Config
@@ -140,7 +141,9 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
 
     metadata = {
         "scheduled-time": scheduled_time,
-        "original-filename": filename,
+        # The browser sends this header as encodeURIComponent(name); sign the
+        # same encoding or names with spaces ("list (5).csv") get a 403.
+        "original-filename": quote(filename, safe="!~*'()"),
         "direct-agent": "yes" if direct_agent else "no",
     }
     if agent_phone:

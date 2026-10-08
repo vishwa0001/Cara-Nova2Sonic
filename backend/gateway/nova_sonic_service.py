@@ -75,11 +75,35 @@ logger = logging.getLogger("nova_sonic_service")
 MAX_STREAM_RESTARTS = 2
 STREAM_RESTART_DELAY_SECONDS = 0.5
 
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+# Voicemail fallback (GENERAL traffic): seconds of no reply after Cara's
+# first turn has finished playing, not after its text arrived (that turn
+# alone takes ~7 s to play).
+VM_NO_REPLY_S = _env_float("CARA_VM_NO_REPLY_S", 8.0)
+# Longest wait for Cara's first turn to finish playing before counting anyway
+VM_FIRST_TURN_MAX_S = 20.0
+# Inbound audio this loud counts as the caller talking; the fallback waits
+# until the line has been quiet this long, since transcripts lag speech.
+CALLER_SOUND_RMS = _env_float("CARA_VM_CALLER_SOUND_RMS", 300.0)
+CALLER_QUIET_S = _env_float("CARA_VM_CALLER_QUIET_S", 1.5)
+
 VOICEMAIL_GREETING_PATTERNS = [
     "leave a message", "leave your message", "not available",
     "please leave", "after the tone", "after the beep",
     "voice mailbox", "voicemail", "mailbox is full",
     "record your message", "unable to take your call",
+    "at the tone", "can't take your call", "cannot take your call",
+    "please record", "when you have finished recording",
+    "when you are finished recording", "enter your four digit pin",
+    "the person you are calling", "the person you are trying to reach",
+    "the number you have dialed", "the subscriber you have dialed",
 ]
 
 UNCLEAR_REPLY_PATTERNS = {
@@ -170,6 +194,10 @@ def _is_callback_closing(text: str) -> bool:
     t = _normalize_quotes(text)
     return _CALLBACK_UNSPECIFIED_MARKER in t or _CALLBACK_SPECIFIC_MARKER in t
 
+
+# Lines only the normal script says; seen on a direct call, Cara is already in
+# it, and "switch_to_normal_call" left her silent (call 10316d32)
+_NORMAL_SCRIPT_MARKERS = ("am i able to speak with", "is now a good time", "can i connect you now")
 
 # Tool result that turns a Direct to Human Agent call into a normal call
 _SWITCH_TO_NORMAL_RESULT = {
@@ -288,6 +316,7 @@ class NovaSonicSession:
         tool_executor: Optional[OutreachToolExecutor] = None,
         voice_id: str = "ruth",
         region_name: Optional[str] = None,
+        on_purge_output: Optional[Callable[[], Any]] = None,
     ):
         self.boto_session = session
         self.model_id = model_id
@@ -311,6 +340,8 @@ class NovaSonicSession:
         self.on_hangup = on_hangup
         self.on_forced_audio = on_forced_audio
         self.on_transfer = on_transfer
+        # Drops audio already queued for the caller (the RTP output queue)
+        self.on_purge_output = on_purge_output
 
         # Tool Executor
         self.tool_executor = tool_executor or OutreachToolExecutor(
@@ -333,9 +364,15 @@ class NovaSonicSession:
         # A direct-mode call switches to the normal script once, the first
         # time the specialist can't be reached
         self._direct_fallback_used = False
+        # Cara already ran the normal script (identity check / "is now a good
+        # time?"), so a missed agent must not tell her to switch to it
+        self._normal_script_spoken = False
         # reschedule_call has booked the callback on this call
         self._reschedule_done = False
         self._last_user_text = ""
+        # Everything the caller said since Cara last spoke (transcripts arrive in pieces)
+        self._user_turn_text = ""
+        self._user_turn_open = False
         # Times the Nova Sonic stream was reopened after it failed before
         # Cara said anything (see _recover_from_stream_error).
         self._stream_restarts = 0
@@ -347,6 +384,13 @@ class NovaSonicSession:
         self._beep_detector = BeepDetector()
         self._beep_confirmed = False
         self._voicemail_handled = False
+        # A message started only because nobody answered; caller speech cancels it
+        self._voicemail_cancellable = False
+        self._voicemail_tasks: List[asyncio.Task] = []
+        # Set once Cara's first spoken turn has finished playing to the caller
+        self._first_turn_played = asyncio.Event()
+        # When the caller's line last carried speech-level audio (time.monotonic)
+        self._last_caller_sound_at: Optional[float] = None
 
         # Identifiers
         self.prompt_name = str(uuid.uuid4())
@@ -375,6 +419,9 @@ class NovaSonicSession:
         self._audio_in_bytes = 0
         self._audio_out_bytes = 0
         self._last_counter_log = time.time()
+
+        # Set once the gateway has opened the call for a silent caller
+        self._opening_started = False
 
     async def _initiate_hangup(self):
         """
@@ -508,7 +555,7 @@ class NovaSonicSession:
             f"[TOOL_RESULT_SENT] Contact {self.contact_id} tool={tool_name} use_id={tool_use_id} status=success"
         )
 
-    async def _run_transfer(self, tool_use_id: str, agent_phone: str):
+    async def _run_transfer(self, tool_use_id: str, agent_phone: str, spoken_text: str = ""):
         """Dial the human agent and hand the patient over, or give Cara the call back.
 
         Cara's "please hold" line plays while the agent's phone rings. If a
@@ -516,6 +563,7 @@ class NovaSonicSession:
         between patient and agent. If not, the held tool result tells Cara
         the specialist didn't pick up, and she runs the callback flow.
         """
+        await self._say_hold_if_missing(spoken_text)
         try:
             answered = bool(await self.on_transfer(agent_phone))
         except Exception:
@@ -545,10 +593,33 @@ class NovaSonicSession:
             }
         await self._send_tool_result(tool_use_id, "evaluate_and_transfer_pes", result)
 
+    async def _say_hold_if_missing(self, spoken_text: str):
+        """Nova often calls the transfer tool without saying the hold line
+        (calls 9af65a8d, 60364398), leaving the patient in silence while the
+        agent rings. Play it from the gateway when this turn didn't say it."""
+        if "hold" in _normalize_quotes(spoken_text or "").lower() or not self.on_forced_audio:
+            return
+        is_direct = bool(self.patient) and self.patient.call_mode == CallMode.MODE_1_DIRECT_HANDOFF
+        if is_direct and not self._direct_fallback_used and not self._normal_script_spoken:
+            # The direct line ends with "please hold"; Nova often calls the tool
+            # before its text arrives, so both played (call 7c016576)
+            return
+        text = (
+            self.patient.render_template(SCRIPT_DEFINITIONS.fast_path_hold)
+            if self.patient
+            else SCRIPT_DEFINITIONS.fast_path_hold
+        )
+        try:
+            pcmu_bytes = await _synthesize_forced_closing_helper(text)
+            await self.on_forced_audio(pcmu_bytes)
+            logger.info(f"[TRANSFER_HOLD] Played the hold line for {self.contact_id}; Nova didn't say it")
+        except Exception:
+            logger.exception(f"[TRANSFER_HOLD_ERROR] Could not play the hold line for {self.contact_id}")
+
     def _take_direct_fallback(self) -> bool:
         """True (once) when a Direct to Human Agent call should continue as a normal call."""
         is_direct = bool(self.patient) and self.patient.call_mode == CallMode.MODE_1_DIRECT_HANDOFF
-        if not is_direct or self._direct_fallback_used:
+        if not is_direct or self._direct_fallback_used or self._normal_script_spoken:
             return False
         self._direct_fallback_used = True
         return True
@@ -574,25 +645,30 @@ class NovaSonicSession:
         except Exception:
             logger.exception(f"[CALLBACK_GUARD_ERROR] for {self.contact_id}")
 
-    async def _handle_voicemail_detected(self):
+    async def _handle_voicemail_detected(self, cancellable: bool = False):
         """
-        Fires on beep detection OR voicemail-greeting-pattern match.
+        Fires on beep detection OR voicemail-greeting-pattern match, or
+        (cancellable=True) when nobody answered Cara's first turn.
         Synthesizes the voicemail message directly via Polly, plays it
         through RTP bypassing Nova Sonic entirely, then forces terminate_call
         and hangup from the gateway side.
+
+        Nova Sonic is muted from here on so two voices never overlap. A
+        message started only because the line was quiet is cancelled if the
+        caller then speaks (see _cancel_voicemail).
         """
         if self._voicemail_handled:
+            if not cancellable:
+                self._voicemail_cancellable = False  # a beep or greeting confirmed it
             return  # idempotent guard
         self._voicemail_handled = True
-
-        asyncio.create_task(
-            self._terminal_trigger_watchdog("VOICEMAIL", timeout_seconds=10.0)
-        )
+        self._voicemail_cancellable = cancellable
+        self.final_disposition = "VOICEMAIL"
 
         logger.info(
             f"[VOICEMAIL_FORCED_CLOSE] Bypassing Nova Sonic stream, "
             f"synthesizing voicemail message directly for "
-            f"{self.contact_id}"
+            f"{self.contact_id} (cancellable={cancellable})"
         )
 
         try:
@@ -602,26 +678,27 @@ class NovaSonicSession:
                 else SCRIPT_DEFINITIONS.voicemail_message
             )
             pcmu_bytes = await _synthesize_forced_closing_helper(voicemail_text)
+            if not self._voicemail_handled:
+                return  # the caller spoke while the message was being synthesized
 
+            # Stop anything Cara was still saying before the message starts
+            self._purge_output()
             if self.on_forced_audio:
                 await self.on_forced_audio(pcmu_bytes)
 
-            self.final_disposition = "VOICEMAIL"
-            if self.tool_executor:
-                await self.tool_executor.terminate_call(
-                    disposition="VOICEMAIL",
-                    reason="No user speech detected or voicemail pattern matched",
-                )
-            self._disconnect_after_speaking = True
+            if not self._voicemail_cancellable:
+                await self._record_voicemail()
+                self._disconnect_after_speaking = True
 
             # Wait for audio to drain through RTP before hanging up (8000 bytes/sec + margin)
             drain_delay = (len(pcmu_bytes) / 8000.0) + 0.3
-
-            async def _delayed_hangup():
-                await asyncio.sleep(drain_delay)
-                await self._initiate_hangup()
-
-            asyncio.create_task(_delayed_hangup())
+            # The safety net must outlast the message, or it cuts it off
+            self._voicemail_tasks = [
+                asyncio.create_task(
+                    self._terminal_trigger_watchdog("VOICEMAIL", timeout_seconds=drain_delay + 10.0)
+                ),
+                asyncio.create_task(self._finish_voicemail(drain_delay)),
+            ]
 
         except Exception:
             logger.exception(
@@ -630,6 +707,48 @@ class NovaSonicSession:
             )
             self._disconnect_after_speaking = True
             asyncio.create_task(self._initiate_hangup())
+
+    async def _record_voicemail(self):
+        if self.tool_executor:
+            await self.tool_executor.terminate_call(
+                disposition="VOICEMAIL",
+                reason="No user speech detected or voicemail pattern matched",
+            )
+
+    async def _finish_voicemail(self, drain_delay: float):
+        """Hang up once the voicemail message has played."""
+        await asyncio.sleep(drain_delay)
+        if not self._voicemail_handled:
+            return  # cancelled: the caller was there after all
+        if self._voicemail_cancellable:
+            self._voicemail_cancellable = False
+            await self._record_voicemail()
+            self._disconnect_after_speaking = True
+        await self._initiate_hangup()
+
+    async def _cancel_voicemail(self, text: str):
+        """The caller spoke during a voicemail message that only started
+        because the line was quiet: stop it and let Cara carry on."""
+        logger.info(
+            f"[VOICEMAIL_CANCELLED] Caller spoke during the voicemail message for "
+            f"{self.contact_id} ({text!r}); stopping it and continuing the call"
+        )
+        self._voicemail_handled = False
+        self._voicemail_cancellable = False
+        for task in self._voicemail_tasks:
+            task.cancel()
+        self._voicemail_tasks = []
+        self.final_disposition = "PATIENT_HANGUP"
+        self._purge_output()  # cut the message off
+
+    def _purge_output(self):
+        """Drop audio queued for the caller right now (no InterruptionFrame:
+        that is processed later and could wipe audio queued after it)."""
+        if self.on_purge_output:
+            try:
+                self.on_purge_output()
+            except Exception:
+                logger.exception(f"[PURGE_OUTPUT_ERROR] for {self.contact_id}")
 
     async def _handle_identity_unconfirmed(self):
         """
@@ -780,18 +899,46 @@ class NovaSonicSession:
             self._identity_double_check_watchdog()
         )
 
-    async def _voicemail_watchdog(self):
-        """Voicemail silence detection fallback for GENERAL traffic."""
-        await asyncio.sleep(10)
-        if not self._user_spoke and self.is_active and not self._voicemail_handled:
-            logger.info(
-                f"[AMD_FALLBACK] No user speech in 10s — "
-                f"treating as voicemail for {self.contact_id}"
-            )
-            await self._handle_voicemail_detected()
+    async def _voicemail_watchdog(self, first_turn_seconds: Optional[float] = None):
+        """Voicemail silence detection fallback for GENERAL traffic.
+
+        Nobody replied to Cara's first turn. The wait starts once that turn
+        has finished playing (first_turn_seconds when the gateway played it,
+        otherwise the RTP queue draining), and is extended while the line
+        carries speech the transcript hasn't caught up with yet.
+        """
+        if first_turn_seconds is not None:
+            await asyncio.sleep(first_turn_seconds)
+        else:
+            try:
+                await asyncio.wait_for(self._first_turn_played.wait(), timeout=VM_FIRST_TURN_MAX_S)
+            except asyncio.TimeoutError:
+                pass
+        deadline = time.monotonic() + VM_NO_REPLY_S
+        while True:
+            await asyncio.sleep(max(0.0, deadline - time.monotonic()))
+            if self._user_spoke or not self.is_active or self._voicemail_handled:
+                return
+            heard = self._last_caller_sound_at
+            if heard is None or time.monotonic() - heard >= CALLER_QUIET_S:
+                break
+            deadline = heard + CALLER_QUIET_S  # the caller may be mid-sentence
+        logger.info(
+            f"[AMD_FALLBACK] No reply {VM_NO_REPLY_S:.0f}s after Cara's first turn finished — "
+            f"treating as voicemail for {self.contact_id}"
+        )
+        await self._handle_voicemail_detected(cancellable=True)
+
+    def _note_caller_sound(self, pcm8k: bytes):
+        if len(pcm8k) != 320:
+            return  # only real 20 ms caller frames, not the ringing-time silence
+        samples = np.frombuffer(pcm8k, dtype=np.int16).astype(np.float32)
+        if float(np.sqrt(np.mean(samples * samples))) >= CALLER_SOUND_RMS:
+            self._last_caller_sound_at = time.monotonic()
 
     async def _on_queue_drained(self):
         """Callback invoked when downstream RTP queue finishes draining audio frames."""
+        self._first_turn_played.set()
         if self._is_assistant_speaking:
             self._is_assistant_speaking = False
             logger.info(
@@ -815,6 +962,66 @@ class NovaSonicSession:
             value=BidirectionalInputPayloadPart(bytes_=payload_bytes)
         )
         await self.stream.input_stream.send(chunk)
+
+    def awaiting_opening(self) -> bool:
+        """True while nobody has started the conversation yet: Cara hasn't
+        spoken, Nova hasn't heard the caller, and no closing path is running."""
+        return (
+            self.is_active
+            and not self._opening_started
+            and self._greeting_spoken_at is None
+            and self._audio_out_bytes == 0
+            and not self._is_assistant_speaking
+            and not self._last_user_text
+            and not self._voicemail_handled
+            and not self._beep_confirmed
+            and not self._disconnect_after_speaking
+            and not self._transfer_pending
+        )
+
+    async def send_opening_cue(self, cue: str):
+        """Tell Nova the caller picked up but is silent, as a USER text turn.
+
+        Behind CARA_OPENING_CUE_ENABLED: a mid-stream text block has hung
+        the stream before (see _handle_identity_unconfirmed).
+        """
+        self._opening_started = True
+        content_name = str(uuid.uuid4())
+        await self._send_event({
+            "contentStart": {
+                "promptName": self.prompt_name,
+                "contentName": content_name,
+                "type": "TEXT",
+                "interactive": True,
+                "role": "USER",
+                "textInputConfiguration": {
+                    "mediaType": "text/plain",
+                },
+            }
+        })
+        await self._send_event({
+            "textInput": {
+                "promptName": self.prompt_name,
+                "contentName": content_name,
+                "content": cue,
+            }
+        })
+        await self._send_event({
+            "contentEnd": {
+                "promptName": self.prompt_name,
+                "contentName": content_name,
+            }
+        })
+        logger.info(f"[OPENING_CUE] Sent {cue} to Nova Sonic for {self.contact_id}")
+
+    def note_forced_opening(self, text: str, audio_seconds: float):
+        """The gateway played Cara's opening line itself (Polly), bypassing Nova."""
+        self._opening_started = True
+        self._last_completed_assistant_turn = text
+        if self._greeting_spoken_at is None:
+            self._greeting_spoken_at = asyncio.get_event_loop().time()
+            if os.getenv("TRAFFIC_TYPE", "GENERAL") == "GENERAL" and not self._watchdog_task:
+                self._watchdog_task = asyncio.create_task(self._voicemail_watchdog(audio_seconds))
 
     async def start(self):
         """Open bidirectional stream to Nova Sonic, transmit initialization headers, and start reader task."""
@@ -981,6 +1188,7 @@ class NovaSonicSession:
             return
         if self._disconnect_after_speaking or self._transfer_pending:
             return  # stop feeding audio once farewell or transfer is committed
+        self._note_caller_sound(pcm8k)
 
         # Beep detection — only matters if we haven't already confirmed voicemail this call
         if not self._beep_confirmed and self._beep_detector.feed_frame(pcm8k):
@@ -1040,6 +1248,8 @@ class NovaSonicSession:
 
                     for event_type, event_data in evt_dict.items():
                         if event_type == "audioOutput":
+                            if self._voicemail_handled:
+                                continue  # the voicemail message is playing; Cara stays silent
                             if not self._is_assistant_speaking:
                                 self._is_assistant_speaking = True
                                 logger.info(f"[NOVA_SPEAKING] Assistant started speaking contact={self.contact_id}")
@@ -1075,12 +1285,15 @@ class NovaSonicSession:
 
                             # Voicemail silence detection tracking
                             if role.upper() == "ASSISTANT":
+                                self._user_turn_open = False
                                 self._last_assistant_text = (
                                     self._last_assistant_text + " " + (text or "")
                                 ).strip()
                                 double_check_marker = "just to double check"
                                 if double_check_marker in self._last_assistant_text.lower():
                                     self._double_check_spoken = True
+                                if any(m in _normalize_quotes(text or "").lower() for m in _NORMAL_SCRIPT_MARKERS):
+                                    self._normal_script_spoken = True
 
                                 if self._greeting_spoken_at is None:
                                     self._greeting_spoken_at = asyncio.get_event_loop().time()
@@ -1120,6 +1333,11 @@ class NovaSonicSession:
                                                     logger.error(f"[TOOL_DB_ERROR] Failed to update outcome post-speech: {ex_db}")
                             elif role.upper() == "USER":
                                 self._last_user_text = text or self._last_user_text
+                                if text:
+                                    self._user_turn_text = (
+                                        f"{self._user_turn_text} {text}".strip() if self._user_turn_open else text
+                                    )
+                                    self._user_turn_open = True
                                 if self.final_disposition == "NO_ENGAGEMENT":
                                     self.final_disposition = "PATIENT_HANGUP"
                                 if self.death_cue_text is None and _has_death_cue(text):
@@ -1151,6 +1369,8 @@ class NovaSonicSession:
                                     return  # don't process this reply through normal flow
                                 else:
                                     self._user_spoke = True
+                                    if self._voicemail_handled and self._voicemail_cancellable:
+                                        await self._cancel_voicemail(text)
                                     if (
                                         self._double_check_spoken
                                         and self._identity_double_check_watchdog_task
@@ -1182,6 +1402,9 @@ class NovaSonicSession:
                                 "terminate_call": self.tool_executor.terminate_call,
                             }
 
+                            if tool_name == "reschedule_call":
+                                tool_input = dict(tool_input, caller_words=self._user_turn_text)
+
                             if tool_name == "terminate_call":
                                 tool_input = dict(tool_input)  # don't mutate the original event
                                 tool_input["last_spoken_text"] = (
@@ -1209,10 +1432,12 @@ class NovaSonicSession:
                                 and not self._transfer_pending
                             ):
                                 # Hold the tool result until we know whether the
-                                # agent picked up; Cara already said "please hold".
+                                # agent picked up; the patient hears "please hold".
                                 self._transfer_pending = True
                                 asyncio.create_task(
-                                    self._run_transfer(tool_use_id, result["agent_phone"])
+                                    self._run_transfer(
+                                        tool_use_id, result["agent_phone"], spoken_text=self._last_assistant_text
+                                    )
                                 )
                                 continue
 
@@ -1414,6 +1639,7 @@ class NovaSonicLLMService(FrameProcessor):
         on_forced_audio: Optional[Callable[[bytes], Any]] = None,
         on_transfer: Optional[Callable[[str], Any]] = None,
         tool_executor: Optional[OutreachToolExecutor] = None,
+        on_purge_output: Optional[Callable[[], Any]] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -1427,6 +1653,7 @@ class NovaSonicLLMService(FrameProcessor):
         self.on_forced_audio = on_forced_audio
         self.on_transfer = on_transfer
         self.tool_executor = tool_executor
+        self.on_purge_output = on_purge_output
         self.session: Optional[NovaSonicSession] = None
         self._is_running = True
 
@@ -1471,6 +1698,7 @@ class NovaSonicLLMService(FrameProcessor):
                 on_transfer=self.on_transfer,
                 tool_executor=self.tool_executor,
                 voice_id=self.voice,
+                on_purge_output=self.on_purge_output,
             )
             await self.session.start()
             logger.info(f"Initialized Nova Sonic session for patient {self.patient.patient_id} (Contact: {self.contact_id})")

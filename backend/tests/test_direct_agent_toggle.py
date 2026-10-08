@@ -54,6 +54,16 @@ class PresignedUrlTests(unittest.TestCase):
         res, s3 = self._presign({"filename": "p.csv", "timezone": "Not/AZone"})
         self.assertNotIn("timezone", s3.generate_presigned_url.call_args[1]["Params"]["Metadata"])
 
+    def test_filename_signed_as_browser_encodes_it(self):
+        # Phones save downloads as "list (5)-1.csv"; the UI sends the header as
+        # encodeURIComponent(name), so the signed value must match that.
+        res, s3 = self._presign({"filename": "sample_customer_calling_list (5)-1.csv"})
+        meta = s3.generate_presigned_url.call_args[1]["Params"]["Metadata"]
+        self.assertEqual(meta["original-filename"], "sample_customer_calling_list%20(5)-1.csv")
+        res, s3 = self._presign({"filename": "liste_é!~*'.csv"})
+        meta = s3.generate_presigned_url.call_args[1]["Params"]["Metadata"]
+        self.assertEqual(meta["original-filename"], "liste_%C3%A9!~*'.csv")
+
     def test_toggle_on_without_phone_is_rejected(self):
         res, s3 = self._presign({"filename": "p.csv", "directAgentEnabled": True})
         self.assertEqual(res["statusCode"], 400)
@@ -81,6 +91,20 @@ class IntakeTests(unittest.TestCase):
         (item,) = self._items()
         self.assertEqual(item["call_mode"], "MODE_2_NORMAL_COACHING")
         self.assertNotIn("human_agent_phone", item)
+
+
+class IntakeFilenameTests(unittest.TestCase):
+    def test_signed_filename_is_decoded(self):
+        s3 = MagicMock()
+        s3.get_object.return_value = {
+            "Body": MagicMock(read=MagicMock(return_value=CSV.encode())),
+            "Metadata": {"original-filename": "sample_customer_calling_list%20(5)-1.csv"},
+        }
+        event = {"Records": [{"s3": {"bucket": {"name": "b"},
+                                     "object": {"key": "campaigns/CAMP-1/patients.csv"}}}]}
+        with patch.object(campaign_intake.boto3, "client", return_value=s3),                 patch.object(campaign_intake, "process_csv_content", return_value={}) as proc:
+            campaign_intake.lambda_handler(event, None)
+        self.assertEqual(proc.call_args[1]["source_filename"], "sample_customer_calling_list (5)-1.csv")
 
 
 class ReadBackTests(unittest.TestCase):
