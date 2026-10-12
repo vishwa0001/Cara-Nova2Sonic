@@ -1113,13 +1113,14 @@ class NovaSonicSession:
                     "toolConfiguration": {
                         "tools": formatted_tools,
                         "toolChoice": {"auto": {}},
+                        "cachePoint": {"type": "default"},
                     },
                 }
             }
             await self._send_event(prompt_start_event)
-            logger.info(f"[NOVA_SONIC_EVT] promptStart event sent for Contact {self.contact_id} (Prompt: {self.prompt_name}) with {len(formatted_tools)} registered tools")
+            logger.info(f"[NOVA_SONIC_EVT] promptStart event sent for Contact {self.contact_id} (Prompt: {self.prompt_name}) with {len(formatted_tools)} registered tools (Prompt Caching enabled)")
 
-            # 3. Send SYSTEM prompt (contentStart -> textInput -> contentEnd)
+            # 3. Send SYSTEM prompt (contentStart -> textInput -> contentEnd) with cachePoint
             await self._send_event({
                 "contentStart": {
                     "promptName": self.prompt_name,
@@ -1129,6 +1130,9 @@ class NovaSonicSession:
                     "interactive": False,
                     "textInputConfiguration": {
                         "mediaType": "text/plain",
+                    },
+                    "cachePoint": {
+                        "type": "default",
                     },
                 }
             })

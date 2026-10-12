@@ -18,6 +18,9 @@
   "speechModelId": "amazon.nova-2-sonic-v1:0",
   "phoneCountryCode": "US",
   "phoneNumberType": "TOLL_FREE",
+  "dialingMode": "SEQUENTIAL",
+  "maxConcurrentCalls": 10,
+  "vadSilenceThresholdMs": 200,
   "allowedDestinationPrefixes": [
     "+1"
   ],

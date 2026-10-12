@@ -39,6 +39,53 @@ _gateway_url_cache: Dict[str, Any] = {"url": None, "resolved_at": 0.0}
 GATEWAY_URL_CACHE_TTL = 60  # seconds
 
 
+def _load_config() -> Dict[str, Any]:
+    """Load config.json if present in the environment or package."""
+    for p in [
+        os.path.join(os.path.dirname(__file__), "config.json"),
+        os.path.join(os.path.dirname(__file__), "..", "config.json"),
+        os.path.join(os.path.dirname(__file__), "backend", "config.json"),
+    ]:
+        if os.path.exists(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    return {}
+
+
+_CONFIG_DATA = _load_config()
+DIALING_MODE_DEFAULT = _CONFIG_DATA.get("dialingMode", _CONFIG_DATA.get("dialing_mode", "SEQUENTIAL"))
+MAX_CONCURRENT_DEFAULT = _CONFIG_DATA.get("maxConcurrentCalls", _CONFIG_DATA.get("max_concurrent_calls", 1 if DIALING_MODE_DEFAULT == "SEQUENTIAL" else 50))
+
+ACTIVE_CALL_STATUSES = ("DIALING", "IN_PROGRESS", "RUNNING")
+
+
+def count_active_calls(table) -> int:
+    """Check how many calls are currently active in DIALING / IN_PROGRESS / RUNNING state."""
+    active_count = 0
+    for status in ACTIVE_CALL_STATUSES:
+        try:
+            resp = table.query(
+                IndexName=INDEX_NAME,
+                KeyConditionExpression=Key("call_status").eq(status),
+                Select="COUNT",
+            )
+            active_count += int(resp.get("Count", 0))
+        except Exception:
+            try:
+                scan_resp = table.scan(
+                    FilterExpression="call_status = :st",
+                    ExpressionAttributeValues={":st": status},
+                    Select="COUNT",
+                )
+                active_count += int(scan_resp.get("Count", 0))
+            except Exception as e:
+                logger.warning(f"Error checking active calls for {status}: {e}")
+    return active_count
+
+
 def _get_dynamodb_resource():
     return boto3.resource(
         "dynamodb",
@@ -262,7 +309,12 @@ def originate_single_call(gateway_url: str, record: Dict[str, Any]) -> Dict[str,
 def lambda_handler(event: Dict[str, Any] = None, context: Any = None) -> Dict[str, Any]:
     """Execute batch campaign dialer pass."""
     now_iso = utc_now_iso()
-    logger.info(f"[DIALER_START] Invocation at {now_iso} (Traffic: {TRAFFIC_TYPE}, CPS: {CPS_LIMIT})")
+    
+    cfg_data = _load_config()
+    dialing_mode = os.environ.get("DIALING_MODE", cfg_data.get("dialingMode", cfg_data.get("dialing_mode", DIALING_MODE_DEFAULT))).strip().upper()
+    max_concurrent = max(1, int(os.environ.get("MAX_CONCURRENT_CALLS", cfg_data.get("maxConcurrentCalls", cfg_data.get("max_concurrent_calls", MAX_CONCURRENT_DEFAULT)))))
+
+    logger.info(f"[DIALER_START] Invocation at {now_iso} (Traffic: {TRAFFIC_TYPE}, Mode: {dialing_mode}, MaxConcurrent: {max_concurrent}, CPS: {CPS_LIMIT})")
 
     ddb = _get_dynamodb_resource()
     table = ddb.Table(TABLE_NAME)
@@ -271,13 +323,45 @@ def lambda_handler(event: Dict[str, Any] = None, context: Any = None) -> Dict[st
 
     logger.info(f"[DIALER_GATEWAY] Using Gateway URL: {gateway_url}")
 
-    due_records = query_due_records(table, now_iso, limit=50)
-    logger.info(f"[DIALER_FOUND] Found {len(due_records)} due records to dial.")
+    # Check active in-flight calls
+    active_calls = count_active_calls(table)
+    logger.info(f"[DIALER_ACTIVE_CHECK] Currently active in-flight calls: {active_calls}")
+
+    if dialing_mode == "SEQUENTIAL":
+        if active_calls >= 1:
+            logger.info(f"[DIALER_SEQUENTIAL] {active_calls} active call(s) currently in progress. Skipping new calls until current call completes.")
+            return {
+                "statusCode": 200,
+                "dialed_count": 0,
+                "active_calls": active_calls,
+                "mode": "SEQUENTIAL",
+                "message": f"Sequential mode active: {active_calls} call(s) currently in progress. Waiting for completion.",
+                "timestamp": now_iso,
+            }
+        batch_limit = 1
+    else:  # PARALLEL
+        available_slots = max(0, max_concurrent - active_calls)
+        if available_slots <= 0:
+            logger.info(f"[DIALER_PARALLEL] Max concurrent call limit reached ({active_calls}/{max_concurrent} active). Waiting for available slots.")
+            return {
+                "statusCode": 200,
+                "dialed_count": 0,
+                "active_calls": active_calls,
+                "mode": "PARALLEL",
+                "message": f"Parallel mode limit reached ({active_calls}/{max_concurrent} active). Waiting for available slots.",
+                "timestamp": now_iso,
+            }
+        batch_limit = min(50, available_slots)
+
+    due_records = query_due_records(table, now_iso, limit=batch_limit)
+    logger.info(f"[DIALER_FOUND] Found {len(due_records)} due records to dial (Mode: {dialing_mode}, Limit: {batch_limit}).")
 
     if not due_records:
         return {
             "statusCode": 200,
             "dialed_count": 0,
+            "active_calls": active_calls,
+            "mode": dialing_mode,
             "message": "No due records found at this time.",
             "timestamp": now_iso,
         }

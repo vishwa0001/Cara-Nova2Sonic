@@ -174,109 +174,67 @@ def update_ecs_service_with_image(
     cluster_name: str = "careharmony-voice-cluster",
     service_name: str = "careharmony-voice-service",
     task_family: str = "careharmony-voice-gateway",
-    connect_instance_id: Optional[str] = None,
     desired_count: int = 1,
     dry_run: bool = False,
 ) -> Dict[str, Any]:
-    """Register new task definition revision and update service to desiredCount=1."""
+    """Register new task definition revision preserving all environment variables and update service."""
     ecs = session.client("ecs")
-    sts = session.client("sts")
-
-    try:
-        caller = sts.get_caller_identity()
-        account_id = caller.get("Account", "123456789012")
-    except Exception:
-        account_id = "123456789012"
-
-    exec_role_arn = f"arn:aws:iam::{account_id}:role/ecsTaskExecutionRole"
-    instance_id = connect_instance_id or os.getenv("CONNECT_INSTANCE_ID", "")
 
     if dry_run:
         logger.info(f"[DRY-RUN] Would register task definition '{task_family}' with image '{image_uri}'")
         logger.info(f"[DRY-RUN] Would update ECS service '{service_name}' on cluster '{cluster_name}' with desiredCount={desired_count}")
         return {
-            "task_definition_arn": f"arn:aws:ecs:{session.region_name}:{account_id}:task-definition/{task_family}:new",
-            "service_arn": f"arn:aws:ecs:{session.region_name}:{account_id}:service/{cluster_name}/{service_name}",
+            "task_definition_arn": f"arn:aws:ecs:{session.region_name}:task-definition/{task_family}:new",
+            "service_arn": f"arn:aws:ecs:{session.region_name}:service/{cluster_name}/{service_name}",
             "desired_count": desired_count,
             "status": "DRY_RUN_UPDATED",
         }
 
-    # Pre-create CloudWatch Log Group
-    logs = session.client("logs")
-    log_group_name = f"/ecs/{task_family}"
-    try:
-        logs.create_log_group(logGroupName=log_group_name)
-        logger.info(f"Created CloudWatch log group '{log_group_name}'")
-    except logs.exceptions.ResourceAlreadyExistsException:
-        pass
-    except Exception as log_err:
-        logger.debug(f"Log group create check: {log_err}")
+    # Fetch current task definition
+    td_resp = ecs.describe_task_definition(taskDefinition=task_family)
+    td = td_resp["taskDefinition"]
 
-    task_def_arn = ""
-    try:
-        logger.info(f"Registering ECS Task Definition revision for family '{task_family}'...")
-        task_reg = ecs.register_task_definition(
-            family=task_family,
-            networkMode="awsvpc",
-            requiresCompatibilities=["FARGATE"],
-            cpu="512",
-            memory="1024",
-            executionRoleArn=exec_role_arn,
-            taskRoleArn=exec_role_arn,
-            containerDefinitions=[
-                {
-                    "name": "pipecat-voice-gateway",
-                    "image": image_uri,
-                    "portMappings": [
-                        {"containerPort": 8000, "hostPort": 8000, "protocol": "tcp"},
-                        {"containerPort": 10000, "hostPort": 10000, "protocol": "udp"},
-                        {"containerPort": 5060, "hostPort": 5060, "protocol": "udp"},
-                    ],
-                    "environment": [
-                        {"name": "AWS_REGION", "value": session.region_name},
-                        {"name": "CONNECT_INSTANCE_ID", "value": instance_id},
-                        {"name": "VOICE_ID", "value": "en-US-Standard-Female"},
-                        {"name": "NOVA_SONIC_MODEL_ID", "value": "amazon.nova-2-sonic-v1:0"},
-                        {"name": "RTP_PORT", "value": "10000"},
-                        {"name": "TRAFFIC_TYPE", "value": "GENERAL"},
-                    ],
-                    "logConfiguration": {
-                        "logDriver": "awslogs",
-                        "options": {
-                            "awslogs-group": f"/ecs/{task_family}",
-                            "awslogs-region": session.region_name,
-                            "awslogs-stream-prefix": "gateway",
-                            "awslogs-create-group": "true",
-                        },
-                    },
-                }
-            ],
-            tags=[{"key": "Project", "value": "CareHarmony-Cara"}],
-        )
-        task_def_arn = task_reg.get("taskDefinition", {}).get("taskDefinitionArn", "")
-        logger.info(f"Registered Task Definition revision: {task_def_arn}")
-    except Exception as reg_err:
-        logger.warning(f"Error registering task definition: {reg_err}")
+    container_defs = td.get("containerDefinitions", [])
+    for c in container_defs:
+        c["image"] = image_uri
+        # Ensure NOVA_SONIC_REGION is us-west-2
+        env = c.get("environment", [])
+        found_region = False
+        for entry in env:
+            if entry.get("name") == "NOVA_SONIC_REGION":
+                entry["value"] = "us-west-2"
+                found_region = True
+        if not found_region:
+            env.append({"name": "NOVA_SONIC_REGION", "value": "us-west-2"})
+        c["environment"] = env
 
-    service_arn = ""
-    try:
-        logger.info(f"Updating ECS service '{service_name}' to task definition revision '{task_def_arn}' with desiredCount={desired_count}...")
-        srv_resp = ecs.update_service(
-            cluster=cluster_name,
-            service=service_name,
-            taskDefinition=task_def_arn or task_family,
-            desiredCount=desired_count,
-            forceNewDeployment=True,
-        )
-        service_arn = srv_resp.get("service", {}).get("serviceArn", "")
-        logger.info(f"Updated ECS Service: {service_name} (desiredCount: {desired_count})")
-    except Exception as srv_err:
-        logger.warning(f"Error updating ECS service '{service_name}': {srv_err}")
+    remove_keys = [
+        "taskDefinitionArn", "revision", "status", "requiresAttributes", 
+        "compatibilities", "registeredAt", "registeredBy", "deregisteredAt"
+    ]
+    task_input = {k: v for k, v in td.items() if k not in remove_keys}
+
+    task_reg = ecs.register_task_definition(**task_input)
+    task_def_arn = task_reg["taskDefinition"]["taskDefinitionArn"]
+    new_rev = task_reg["taskDefinition"]["revision"]
+    logger.info(f"Registered Task Definition revision: {task_def_arn} (Revision {new_rev})")
+
+    logger.info(f"Updating ECS service '{service_name}' to revision {new_rev} (forceNewDeployment=True)...")
+    srv_resp = ecs.update_service(
+        cluster=cluster_name,
+        service=service_name,
+        taskDefinition=task_def_arn,
+        desiredCount=desired_count,
+        forceNewDeployment=True,
+    )
+    service_arn = srv_resp.get("service", {}).get("serviceArn", "")
+    logger.info(f"Updated ECS Service: {service_name} (desiredCount: {desired_count})")
 
     return {
         "task_definition_arn": task_def_arn,
         "service_arn": service_arn,
         "desired_count": desired_count,
+        "revision": new_rev,
         "status": "UPDATED",
     }
 
@@ -286,10 +244,11 @@ def wait_and_bind_task_ip_to_chime(
     cluster_name: str = "careharmony-voice-cluster",
     service_name: str = "careharmony-voice-service",
     vc_name: str = "careharmony-voice-connector",
-    max_wait_seconds: int = 60,
+    expected_task_def_arn: Optional[str] = None,
+    max_wait_seconds: int = 120,
     dry_run: bool = False,
 ) -> Optional[str]:
-    """Poll ECS task until RUNNING, resolve public IP from ENI, and update Chime Voice Connector termination."""
+    """Poll ECS task until RUNNING with expected_task_def_arn, resolve public IP from ENI, and update Chime Voice Connector termination."""
     import time
     if dry_run:
         logger.info("[DRY-RUN] Would poll ECS task for public IP and register with Chime Voice Connector")
@@ -299,7 +258,7 @@ def wait_and_bind_task_ip_to_chime(
     ec2 = session.client("ec2")
     chime = session.client("chime-sdk-voice")
 
-    logger.info(f"Waiting for ECS Task in '{cluster_name}' to reach RUNNING status...")
+    logger.info(f"Waiting for ECS Task in '{cluster_name}' with definition '{expected_task_def_arn or 'any'}' to reach RUNNING status...")
     start_time = time.time()
     task_arn = None
     eni_id = None
@@ -310,18 +269,23 @@ def wait_and_bind_task_ip_to_chime(
             tasks_resp = ecs.list_tasks(cluster=cluster_name, serviceName=service_name, desiredStatus="RUNNING")
             task_arns = tasks_resp.get("taskArns", [])
             if task_arns:
-                task_desc = ecs.describe_tasks(cluster=cluster_name, tasks=[task_arns[0]])
+                task_desc = ecs.describe_tasks(cluster=cluster_name, tasks=task_arns)
                 tasks = task_desc.get("tasks", [])
-                if tasks and tasks[0].get("lastStatus") == "RUNNING":
-                    task_arn = tasks[0]["taskArn"]
-                    for attachment in tasks[0].get("attachments", []):
-                        if attachment.get("type") == "ElasticNetworkInterface":
-                            for detail in attachment.get("details", []):
-                                if detail.get("name") == "networkInterfaceId":
-                                    eni_id = detail.get("value")
-                                    break
-                    if eni_id:
-                        break
+                for t in tasks:
+                    if t.get("lastStatus") == "RUNNING":
+                        if expected_task_def_arn and t.get("taskDefinitionArn") != expected_task_def_arn:
+                            continue
+                        task_arn = t["taskArn"]
+                        for attachment in t.get("attachments", []):
+                            if attachment.get("type") == "ElasticNetworkInterface":
+                                for detail in attachment.get("details", []):
+                                    if detail.get("name") == "networkInterfaceId":
+                                        eni_id = detail.get("value")
+                                        break
+                        if eni_id:
+                            break
+                if eni_id:
+                    break
         except Exception as e:
             logger.debug(f"Polling ECS task status note: {e}")
         time.sleep(5)
@@ -422,6 +386,7 @@ def deploy_gateway(
         session,
         cluster_name=cluster_name,
         service_name=service_name,
+        expected_task_def_arn=ecs_results.get("task_definition_arn"),
         dry_run=dry_run,
     )
 

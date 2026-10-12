@@ -54,6 +54,8 @@ class ProjectConfig:
     cara_behavior: dict[str, Any]
     root: Path
     max_reschedule_attempts: int = 10
+    dialing_mode: str = "SEQUENTIAL"
+    max_concurrent_calls: int = 1
 
     @property
     def prompt_path(self) -> Path:
@@ -145,6 +147,8 @@ def load_config(path: str | Path | None = None) -> ProjectConfig:
         cara_behavior=dict(_required(data, "caraBehavior")),
         root=root,
         max_reschedule_attempts=int(data.get("maxRescheduleAttempts", data.get("max_reschedule_attempts", 10))),
+        dialing_mode=str(data.get("dialingMode", data.get("dialing_mode", "SEQUENTIAL"))).upper(),
+        max_concurrent_calls=max(1, int(data.get("maxConcurrentCalls", data.get("max_concurrent_calls", 1)))),
     )
     validate_config(cfg)
     return cfg

@@ -8,6 +8,7 @@ Implements the core conversational tools:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import functools
 import logging
@@ -206,6 +207,7 @@ class OutreachToolExecutor:
         connect_client: Any = None,
         patient_context: Optional[PatientContext] = None,
         contact_id: Optional[str] = None,
+        is_sip_call: bool = False,
     ):
         self.api_base_url = api_base_url or os.environ.get("MOCK_API_BASE_URL", "http://127.0.0.1:8000")
         self.connect_instance_id = connect_instance_id or os.environ.get(
@@ -220,6 +222,20 @@ class OutreachToolExecutor:
         )
         self.contact_id = contact_id
         self.call_id = contact_id
+        # True for calls bridged over Chime SIP/RTP, where no Amazon Connect
+        # contact exists — update_contact_attributes always fails there, so
+        # callers of this executor skip it rather than wait for it to error.
+        self.is_sip_call = is_sip_call
+        # Holds references to fire-and-forget background tasks (webhook
+        # dispatch, DynamoDB writes) so they aren't garbage-collected mid-flight.
+        self._background_tasks: set = set()
+
+    def _fire_and_forget(self, coro) -> None:
+        """Schedule `coro` without blocking the caller, keeping a reference
+        alive until it completes so the task can't be GC'd mid-run."""
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     async def evaluate_and_transfer_pes(
         self,
@@ -288,10 +304,16 @@ class OutreachToolExecutor:
                 "checkedAt": avail_data.get("checkedAt", now_iso),
             }
 
-            # A. Persist assignedAgent to DynamoDB CareHarmony_OutreachRecords
-            self.storage.link_assigned_agent(active_patient_id, assigned_agent)
+            # A. Persist assignedAgent to DynamoDB CareHarmony_OutreachRecords.
+            # Fired off the event loop (boto3 is sync) and not awaited — the
+            # caller already hears "please hold" while this resolves.
+            self._fire_and_forget(
+                asyncio.to_thread(self.storage.link_assigned_agent, active_patient_id, assigned_agent)
+            )
 
-            # B. Dispatch POST /api/v1/webhooks/call-handoff
+            # B. Dispatch POST /api/v1/webhooks/call-handoff.
+            # Fired in the background too: this call alone was ~650ms and
+            # blocked the turn before "please hold" bought us that time.
             webhook_url = f"{self.api_base_url.rstrip('/')}/api/v1/webhooks/call-handoff"
             handoff_body = {
                 "callId": active_call_id,
@@ -309,27 +331,35 @@ class OutreachToolExecutor:
                     {"speaker": "system", "text": "Transfer initiated", "timestamp": now_iso}
                 ],
             }
-            try:
-                async with httpx.AsyncClient(timeout=2.0) as client:
-                    await client.post(webhook_url, json=handoff_body)
-            except Exception as w_err:
-                logger.warning(f"Handoff webhook dispatch failed: {w_err}")
 
-            # C. Trigger Amazon Connect Contact Attribute update for telephony transfer bridge
-            try:
-                self.connect.update_contact_attributes(
-                    InstanceId=self.connect_instance_id,
-                    InitialContactId=active_call_id,
-                    Attributes={
-                        "RouteAction": "TRANSFER_PES",
-                        "TargetPhoneNumber": agent_phone,
-                        "AssignedAgentId": agent_id,
-                        "AssignedAgentName": agent_name,
-                    },
-                )
-                logger.info(f"Updated Connect contact {active_call_id} attributes with RouteAction=TRANSFER_PES")
-            except Exception as c_err:
-                logger.debug(f"Connect update_contact_attributes simulated/offline: {c_err}")
+            async def _dispatch_handoff_webhook() -> None:
+                try:
+                    async with httpx.AsyncClient(timeout=2.0) as client:
+                        await client.post(webhook_url, json=handoff_body)
+                except Exception as w_err:
+                    logger.warning(f"Handoff webhook dispatch failed: {w_err}")
+
+            self._fire_and_forget(_dispatch_handoff_webhook())
+
+            # C. Trigger Amazon Connect Contact Attribute update for telephony
+            # transfer bridge. Skipped for SIP-originated calls: there's no
+            # Connect contact behind them, so this call always fails and is
+            # pure dead weight — not worth waiting on it to error out.
+            if not self.is_sip_call:
+                try:
+                    self.connect.update_contact_attributes(
+                        InstanceId=self.connect_instance_id,
+                        InitialContactId=active_call_id,
+                        Attributes={
+                            "RouteAction": "TRANSFER_PES",
+                            "TargetPhoneNumber": agent_phone,
+                            "AssignedAgentId": agent_id,
+                            "AssignedAgentName": agent_name,
+                        },
+                    )
+                    logger.info(f"Updated Connect contact {active_call_id} attributes with RouteAction=TRANSFER_PES")
+                except Exception as c_err:
+                    logger.debug(f"Connect update_contact_attributes simulated/offline: {c_err}")
 
             return {
                 "success": True,
@@ -397,7 +427,9 @@ class OutreachToolExecutor:
             summary = format_call_summary("RESCHEDULED")
             await self.storage.mark_call_ended(active_patient_id, summary)
 
-            if active_call_id:
+            # Skipped for SIP-originated calls: no Connect contact exists
+            # behind them, so this call always fails and just adds latency.
+            if active_call_id and not self.is_sip_call:
                 try:
                     self.connect.update_contact_attributes(
                         InstanceId=self.connect_instance_id,

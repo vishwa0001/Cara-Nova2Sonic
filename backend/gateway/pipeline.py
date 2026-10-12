@@ -310,6 +310,7 @@ class CaraVoicePipeline:
             patient_context=self.patient,
             contact_id=self.call_id,
             storage_service=self.storage,
+            is_sip_call=bool(media_server),
         )
 
         async def _on_forced_audio(pcmu_bytes: bytes):
