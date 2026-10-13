@@ -284,13 +284,13 @@ def resample_24k_to_8k(pcm24k_bytes: bytes) -> bytes:
         return resampled.tobytes()
 
 
-async def _synthesize_forced_closing_helper(text: str) -> bytes:
+async def _synthesize_forced_closing_helper(text: str, voice: str = "") -> bytes:
     """Helper to synthesize forced closing lines via Polly, bypassing Nova Sonic."""
     try:
         from gateway.pipeline import synthesize_forced_closing
     except ImportError:
         from backend.gateway.pipeline import synthesize_forced_closing
-    return await synthesize_forced_closing(text)
+    return await synthesize_forced_closing(text, voice)
 
 
 # ==============================================================================
@@ -593,6 +593,10 @@ class NovaSonicSession:
             }
         await self._send_tool_result(tool_use_id, "evaluate_and_transfer_pes", result)
 
+    def _voice_key(self) -> str:
+        """Campaign voice for the Polly lines, so they match the UI choice."""
+        return self.patient.voice if self.patient else ""
+
     async def _say_hold_if_missing(self, spoken_text: str):
         """Nova often calls the transfer tool without saying the hold line
         (calls 9af65a8d, 60364398), leaving the patient in silence while the
@@ -610,7 +614,7 @@ class NovaSonicSession:
             else SCRIPT_DEFINITIONS.fast_path_hold
         )
         try:
-            pcmu_bytes = await _synthesize_forced_closing_helper(text)
+            pcmu_bytes = await _synthesize_forced_closing_helper(text, self._voice_key())
             await self.on_forced_audio(pcmu_bytes)
             logger.info(f"[TRANSFER_HOLD] Played the hold line for {self.contact_id}; Nova didn't say it")
         except Exception:
@@ -677,7 +681,7 @@ class NovaSonicSession:
                 if self.patient
                 else SCRIPT_DEFINITIONS.voicemail_message
             )
-            pcmu_bytes = await _synthesize_forced_closing_helper(voicemail_text)
+            pcmu_bytes = await _synthesize_forced_closing_helper(voicemail_text, self._voice_key())
             if not self._voicemail_handled:
                 return  # the caller spoke while the message was being synthesized
 
@@ -783,7 +787,7 @@ class NovaSonicSession:
                 if self.patient
                 else SCRIPT_DEFINITIONS.identity_unconfirmed_closing
             )
-            pcmu_bytes = await _synthesize_forced_closing_helper(closing_text)
+            pcmu_bytes = await _synthesize_forced_closing_helper(closing_text, self._voice_key())
 
             # Play directly through the RTP output, same mechanism
             # as the proven call-recording disclosure
@@ -876,7 +880,7 @@ class NovaSonicSession:
                 if self.patient
                 else SCRIPT_DEFINITIONS.identity_simple_reprompt
             )
-            pcmu_bytes = await _synthesize_forced_closing_helper(reprompt_text)
+            pcmu_bytes = await _synthesize_forced_closing_helper(reprompt_text, self._voice_key())
             if self.on_forced_audio:
                 await self.on_forced_audio(pcmu_bytes)
             logger.info(

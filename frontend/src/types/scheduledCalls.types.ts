@@ -81,6 +81,7 @@ export interface ScheduledUpload {
   callMode?: CallMode;
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
+  voice?: string;
   validationSummary?: ValidationSummary;
   summary?: CampaignDispositionSummary;
   patientResults?: CampaignPatientResult[];
@@ -100,6 +101,7 @@ export interface ScheduleSubmissionPayload {
   validationSummary: ValidationSummary;
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
+  voice?: string;
   originalRecordId?: string;
 }
 

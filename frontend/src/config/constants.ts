@@ -8,6 +8,16 @@ export const CONFIG = {
     DISPLAY: "IST (UTC+05:30)",
   },
   ALLOWED_EXTENSIONS: [".csv"],
+  // Cara's voice for the whole call; Joanna is the default.
+  DEFAULT_VOICE: "joanna",
+  VOICE_OPTIONS: [
+    { value: "joanna", label: "Joanna (US, female)" },
+    { value: "tiffany", label: "Tiffany (US, female)" },
+    { value: "matthew", label: "Matthew (US, male)" },
+    { value: "amy", label: "Amy (UK, female)" },
+    { value: "olivia", label: "Olivia (Australian, female)" },
+    { value: "kiara", label: "Kiara (Indian, female)" },
+  ],
   REQUIRED_COLUMNS: [
     "empi",
     "first_name",

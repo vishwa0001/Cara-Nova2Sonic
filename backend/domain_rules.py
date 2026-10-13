@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Final, Optional
+from typing import Any, Dict, Final, Optional, Tuple
 
 
 # ==============================================================================
@@ -54,6 +54,24 @@ PLACEHOLDER_LAST_NAME: Final[str] = "[LAST NAME]"
 PLACEHOLDER_PRACTICE_NAME: Final[str] = "[PRACTICE NAME]"
 PLACEHOLDER_CALLBACK_NUMBER: Final[str] = "[CALLBACK NUMBER]"
 
+# Voices picked in the UI: key -> (Nova Sonic voice, Polly voice). Nova speaks
+# the conversation; Polly speaks the scripted lines (opening, forced closings).
+# Nova has no Joanna, so "joanna" pairs Polly Joanna with Nova's US Tiffany.
+CARA_VOICES: Final[Dict[str, Tuple[str, str]]] = {
+    "joanna": ("tiffany", "Joanna"),
+    "tiffany": ("tiffany", "Ruth"),
+    "matthew": ("matthew", "Matthew"),
+    "amy": ("amy", "Amy"),
+    "olivia": ("olivia", "Olivia"),
+    "kiara": ("kiara", "Kajal"),
+}
+DEFAULT_CARA_VOICE: Final[str] = "joanna"
+
+
+def resolve_voice(voice: str) -> Tuple[str, str]:
+    """(Nova voice, Polly voice) for a UI voice key; unknown keys get the default."""
+    return CARA_VOICES.get((voice or "").strip().lower(), CARA_VOICES[DEFAULT_CARA_VOICE])
+
 
 @dataclass(frozen=True)
 class PatientContext:
@@ -72,6 +90,8 @@ class PatientContext:
     human_agent_phone: str = ""
     # Campaign timezone from the UI (IANA name); callback times are read in it
     timezone: str = ""
+    # Campaign voice from the UI (a CARA_VOICES key)
+    voice: str = DEFAULT_CARA_VOICE
 
     amd_result: str = "HUMAN"  # "HUMAN" | "VOICEMAIL" | "UNKNOWN"
 

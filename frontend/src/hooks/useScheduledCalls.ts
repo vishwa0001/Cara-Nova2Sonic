@@ -29,6 +29,7 @@ export function useScheduledCalls() {
   const [directAgentEnabled, setDirectAgentEnabled] = useState<boolean>(false);
   const [humanAgentPhoneNumber, setHumanAgentPhoneNumber] =
     useState<string>("+1 252 500 0184");
+  const [voice, setVoice] = useState<string>(CONFIG.DEFAULT_VOICE);
 
   // Validation State
   const [metaErrors, setMetaErrors] = useState<ValidationError[]>([]);
@@ -217,6 +218,7 @@ export function useScheduledCalls() {
         validationSummary,
         directAgentEnabled,
         humanAgentPhoneNumber: humanAgentPhoneNumber.trim(),
+        voice,
       });
 
       setSuccessMessage("Calls scheduled successfully.");
@@ -303,6 +305,7 @@ export function useScheduledCalls() {
     setDirectAgentEnabled(false);
     setHumanAgentPhoneNumber("");
     setAgentPhoneError(null);
+    setVoice(CONFIG.DEFAULT_VOICE);
     setShowConfirmModal(false);
   };
 
@@ -381,6 +384,8 @@ export function useScheduledCalls() {
     humanAgentPhoneNumber,
     setHumanAgentPhoneNumber,
     agentPhoneError,
+    voice,
+    setVoice,
     handleHumanAgentPhoneChange,
     handleToggleDirectAgent,
     handleFileSelect,

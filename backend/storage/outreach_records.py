@@ -199,6 +199,9 @@ def write_patient_record(
         campaign_timezone = str(patient.get("timezone") or "").strip()
         if campaign_timezone:
             item["timezone"] = campaign_timezone
+        voice = str(patient.get("voice") or "").strip()
+        if voice:
+            item["voice"] = voice
 
         if file_size_bytes and file_size_bytes > 0:
             item["file_size_bytes"] = file_size_bytes

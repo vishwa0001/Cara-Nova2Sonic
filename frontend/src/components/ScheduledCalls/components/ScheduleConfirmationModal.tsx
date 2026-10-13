@@ -1,5 +1,6 @@
 import React from 'react';
-import { AlertCircle, Calendar, FileText, Globe, Headset, Loader2, Phone, Users, X } from 'lucide-react';
+import { AlertCircle, Calendar, FileText, Globe, Headset, Loader2, Mic, Phone, Users, X } from 'lucide-react';
+import { CONFIG } from '../../../config/constants';
 import { formatDateTimeInZone, getTimezoneOffsetDisplay } from '../../../utils/timezone';
 
 interface ScheduleConfirmationModalProps {
@@ -10,6 +11,7 @@ interface ScheduleConfirmationModalProps {
   timezone: string;
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
+  voice?: string;
   isSubmitting: boolean;
   onClose: () => void;
   onConfirm: () => void;
@@ -23,6 +25,7 @@ export const ScheduleConfirmationModal: React.FC<ScheduleConfirmationModalProps>
   timezone,
   directAgentEnabled,
   humanAgentPhoneNumber,
+  voice,
   isSubmitting,
   onClose,
   onConfirm,
@@ -30,6 +33,7 @@ export const ScheduleConfirmationModal: React.FC<ScheduleConfirmationModalProps>
   if (!isOpen) return null;
 
   const tzOffsetDisplay = getTimezoneOffsetDisplay(timezone);
+  const voiceLabel = CONFIG.VOICE_OPTIONS.find((v) => v.value === voice)?.label;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm animate-in fade-in duration-200">
@@ -108,6 +112,18 @@ export const ScheduleConfirmationModal: React.FC<ScheduleConfirmationModalProps>
               </div>
               <span className="font-bold text-slate-900 dark:text-slate-100 font-mono">
                 {humanAgentPhoneNumber}
+              </span>
+            </div>
+          )}
+
+          {voiceLabel && (
+            <div className="bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-xl border border-slate-200 dark:border-slate-700/50 flex items-center justify-between">
+              <div className="flex items-center gap-2.5 text-slate-500 dark:text-slate-400">
+                <Mic className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                <span>Cara's Voice:</span>
+              </div>
+              <span className="font-semibold text-slate-900 dark:text-slate-100">
+                {voiceLabel}
               </span>
             </div>
           )}

@@ -30,7 +30,7 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineTask
 
-from domain_rules import CALL_CONNECTED_CUE, SCRIPT_DEFINITIONS, CallMode, PatientContext
+from domain_rules import CALL_CONNECTED_CUE, SCRIPT_DEFINITIONS, CallMode, PatientContext, resolve_voice
 from gateway.caller_speech import CallerSpeechDetector, load_vad_model
 from gateway.kvs_transport import KVSInputProcessor, KVSOutputProcessor
 from gateway.nova_sonic_service import NovaSonicLLMService
@@ -102,7 +102,7 @@ def _get_polly_client():
     return _polly_client
 
 
-async def synthesize_forced_closing(text: str) -> bytes:
+async def synthesize_forced_closing(text: str, voice: str = "") -> bytes:
     """
     Synthesizes a short closing line via Polly as 8kHz PCMU,
     used ONLY for forced call-ending scenarios where Nova Sonic's
@@ -118,7 +118,7 @@ async def synthesize_forced_closing(text: str) -> bytes:
             Text=text,
             OutputFormat="pcm",
             SampleRate="8000",
-            VoiceId="Ruth",
+            VoiceId=resolve_voice(voice)[1],
             Engine="neural",
         ),
     )
@@ -262,6 +262,7 @@ class CaraVoicePipeline:
                 reschedule_count=patient_context.reschedule_count,
                 human_agent_phone=patient_context.human_agent_phone,
                 timezone=patient_context.timezone,
+                voice=patient_context.voice,
                 amd_result=self.amd_result,
             )
         else:
@@ -345,6 +346,7 @@ class CaraVoicePipeline:
         self.input_processor = KVSInputProcessor(target_sample_rate=16000)
         self.nova_sonic = NovaSonicLLMService(
             patient_context=self.patient,
+            voice=resolve_voice(self.patient.voice if self.patient else "")[0],
             contact_id=self.call_id,
             on_hangup=_on_cara_hangup,
             on_forced_audio=_on_forced_audio,
@@ -448,7 +450,7 @@ class CaraVoicePipeline:
 
     async def _synthesize_opening(self) -> Optional[bytes]:
         try:
-            return await synthesize_forced_closing(self._opening_text())
+            return await synthesize_forced_closing(self._opening_text(), self.patient.voice)
         except Exception:
             logger.exception(f"[OPENING] Could not synthesize the opening line for {self.call_id}")
             return None
@@ -709,6 +711,7 @@ class KVSStreamConsumerWorker:
         invite_headers: Optional[Dict[str, str]] = None,
         human_agent_phone: str = "",
         timezone: str = "",
+        voice: str = "",
         answered: bool = True,
     ) -> CaraVoicePipeline:
         """Instantiate and start a new CaraVoicePipeline for an active contact."""
@@ -748,6 +751,7 @@ class KVSStreamConsumerWorker:
             direct_agent=mode_enum == CallMode.MODE_1_DIRECT_HANDOFF,
             human_agent_phone=human_agent_phone,
             timezone=timezone,
+            voice=voice,
         )
         pipeline = CaraVoicePipeline(
             patient_context=patient_ctx,
@@ -869,6 +873,7 @@ def _session_args(call_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         "provider_name": meta.get("provider_name", ""),
         "human_agent_phone": meta.get("human_agent_phone", ""),
         "timezone": meta.get("timezone", ""),
+        "voice": meta.get("voice", ""),
     }
 
 
@@ -1118,6 +1123,7 @@ async def originate_call_endpoint(payload: Dict[str, Any]):
         "call_mode": payload.get("call_mode", "MODE_2_NORMAL_COACHING"),
         "human_agent_phone": payload.get("human_agent_phone", ""),
         "timezone": payload.get("timezone", ""),
+        "voice": payload.get("voice", ""),
     }
 
     call_id = await sip_signaling_server.originate_call(

@@ -278,6 +278,7 @@ def originate_single_call(gateway_url: str, record: Dict[str, Any]) -> Dict[str,
         "call_mode": record.get("call_mode", "MODE_2_NORMAL_COACHING"),
         "human_agent_phone": record.get("human_agent_phone", ""),
         "timezone": record.get("timezone", ""),
+        "voice": record.get("voice", ""),
     }
 
     req_data = json.dumps(payload).encode("utf-8")

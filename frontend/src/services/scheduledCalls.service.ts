@@ -229,6 +229,7 @@ export function mapApiRecordToScheduledUpload(raw: any): ScheduledUpload {
     callMode: raw.callMode || (raw.directAgentEnabled ? 'DIRECT_HUMAN_HANDOFF' : 'NORMAL'),
     directAgentEnabled: raw.directAgentEnabled ?? (raw.callMode === 'DIRECT_HUMAN_HANDOFF'),
     humanAgentPhoneNumber: raw.humanAgentPhoneNumber || undefined,
+    voice: raw.voice || undefined,
     validationSummary,
     summary: raw.summary,
     patientResults: raw.patientResults,
@@ -301,6 +302,7 @@ class ScheduledCallsService {
         callMode: data.callMode,
         directAgentEnabled: data.directAgentEnabled,
         humanAgentPhoneNumber: data.humanAgentPhoneNumber || rawRecords[0]?.human_agent_phone,
+        voice: data.voice || rawRecords[0]?.voice,
         patientResults: mappedRecords,
       });
       upload.patientResults = mappedRecords;
@@ -340,6 +342,7 @@ class ScheduledCallsService {
           rows: payload.customerCount,
           directAgentEnabled: !!payload.directAgentEnabled,
           humanAgentPhoneNumber: payload.humanAgentPhoneNumber || '',
+          voice: payload.voice || CONFIG.DEFAULT_VOICE,
           timezone: payload.timezone || CONFIG.TIMEZONE.IANA,
         }),
       });
@@ -386,6 +389,7 @@ class ScheduledCallsService {
         callMode: initData.directAgentEnabled ? 'DIRECT_HUMAN_HANDOFF' : 'NORMAL',
         directAgentEnabled: !!initData.directAgentEnabled,
         humanAgentPhoneNumber: initData.humanAgentPhoneNumber || payload.humanAgentPhoneNumber,
+        voice: initData.voice || payload.voice,
         validationSummary: payload.validationSummary,
         originalRecordId: payload.originalRecordId,
       };

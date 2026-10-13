@@ -56,6 +56,9 @@ S3_BUCKET_NAME = os.environ.get(
     "CAMPAIGN_BUCKET_NAME", "cara-health-bot-campaigns-701348334422-us-east-1"
 )
 TABLE_NAME = os.environ.get("OUTREACH_RECORDS_TABLE", DEFAULT_TABLE_NAME)
+# Voice keys the UI can pick; the gateway maps each to Nova + Polly voices.
+VOICES = ("joanna", "tiffany", "matthew", "amy", "olivia", "kiara")
+DEFAULT_VOICE = "joanna"
 
 
 def _build_response(status_code: int, body: Any) -> Dict[str, Any]:
@@ -113,6 +116,7 @@ def _call_mode_fields(record: Dict[str, Any]) -> Dict[str, Any]:
         "callMode": "DIRECT_HUMAN_HANDOFF" if direct else "NORMAL",
         "directAgentEnabled": direct,
         "humanAgentPhoneNumber": record.get("human_agent_phone", ""),
+        "voice": record.get("voice") or DEFAULT_VOICE,
     }
 
 
@@ -136,6 +140,10 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
     elif direct_agent:
         return _build_response(400, {"error": "humanAgentPhoneNumber is required when Direct to Human Agent is on"})
 
+    voice = str(body.get("voice") or DEFAULT_VOICE).strip().lower()
+    if voice not in VOICES:
+        return _build_response(400, {"error": f"voice must be one of: {', '.join(VOICES)}"})
+
     campaign_id = generate_campaign_id()
     s3_key = f"campaigns/{campaign_id}/patients.csv"
 
@@ -145,6 +153,7 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
         # same encoding or names with spaces ("list (5).csv") get a 403.
         "original-filename": quote(filename, safe="!~*'()"),
         "direct-agent": "yes" if direct_agent else "no",
+        "voice": voice,
     }
     if agent_phone:
         metadata["human-agent-phone"] = agent_phone
@@ -179,6 +188,7 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
             "fileName": filename,
             "directAgentEnabled": direct_agent,
             "humanAgentPhoneNumber": agent_phone,
+            "voice": voice,
             # Exact x-amz-meta-* headers the PUT must send to match the signature.
             "uploadHeaders": {f"x-amz-meta-{k}": v for k, v in metadata.items()},
         })

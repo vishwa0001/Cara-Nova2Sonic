@@ -1,5 +1,6 @@
 import React, { useRef } from 'react';
-import { CalendarClock, CheckCircle2, Headset, Loader2, Phone, RotateCcw, Send } from 'lucide-react';
+import { CalendarClock, CheckCircle2, Headset, Loader2, Mic, Phone, RotateCcw, Send } from 'lucide-react';
+import { CONFIG } from '../../config/constants';
 import { useScheduledCalls } from '../../hooks/useScheduledCalls';
 import { CustomerSheetUpload } from './components/CustomerSheetUpload';
 import { Header } from './components/Header';
@@ -43,6 +44,8 @@ export const ScheduledCallsPage: React.FC = () => {
     directAgentEnabled,
     humanAgentPhoneNumber,
     agentPhoneError,
+    voice,
+    setVoice,
     handleHumanAgentPhoneChange,
     handleToggleDirectAgent,
     handleFileSelect,
@@ -215,6 +218,29 @@ export const ScheduledCallsPage: React.FC = () => {
               </div>
             </div>
 
+            {/* SECTION: Cara's Voice (Campaign-Level Setting) */}
+            <div className="bg-slate-50/70 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-2">
+              <label htmlFor="cara-voice" className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                <Mic className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                Cara's Voice
+              </label>
+              <select
+                id="cara-voice"
+                value={voice}
+                onChange={(e) => setVoice(e.target.value)}
+                className="w-full max-w-md px-3 py-2 text-xs sm:text-sm bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:focus:ring-indigo-400 text-slate-900 dark:text-slate-100"
+              >
+                {CONFIG.VOICE_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                The voice patients hear for every call in this batch.
+              </p>
+            </div>
+
             {/* Validation Breakdown Summary */}
             <ValidationSummaryCallout summary={validationSummary} />
 
@@ -301,6 +327,7 @@ export const ScheduledCallsPage: React.FC = () => {
         timezone={selectedTimezone}
         directAgentEnabled={directAgentEnabled}
         humanAgentPhoneNumber={humanAgentPhoneNumber}
+        voice={voice}
         isSubmitting={isSubmitting}
         onClose={() => setShowConfirmModal(false)}
         onConfirm={handleConfirmSchedule}
