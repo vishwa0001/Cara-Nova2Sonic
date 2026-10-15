@@ -1,6 +1,7 @@
 import React from 'react';
-import { AlertCircle, Calendar, FileText, Globe, Headset, Loader2, Mic, Phone, Users, X } from 'lucide-react';
+import { AlertCircle, Calendar, FileText, Globe, Headset, Layers, Loader2, Mic, Phone, Users, X } from 'lucide-react';
 import { CONFIG } from '../../../config/constants';
+import type { DialingMode } from '../../../types/scheduledCalls.types';
 import { formatDateTimeInZone, getTimezoneOffsetDisplay } from '../../../utils/timezone';
 
 interface ScheduleConfirmationModalProps {
@@ -12,6 +13,8 @@ interface ScheduleConfirmationModalProps {
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
   voice?: string;
+  dialingMode?: DialingMode;
+  maxConcurrentCalls?: string;
   isSubmitting: boolean;
   onClose: () => void;
   onConfirm: () => void;
@@ -26,6 +29,8 @@ export const ScheduleConfirmationModal: React.FC<ScheduleConfirmationModalProps>
   directAgentEnabled,
   humanAgentPhoneNumber,
   voice,
+  dialingMode,
+  maxConcurrentCalls,
   isSubmitting,
   onClose,
   onConfirm,
@@ -112,6 +117,18 @@ export const ScheduleConfirmationModal: React.FC<ScheduleConfirmationModalProps>
               </div>
               <span className="font-bold text-slate-900 dark:text-slate-100 font-mono">
                 {humanAgentPhoneNumber}
+              </span>
+            </div>
+          )}
+
+          {dialingMode && (
+            <div className="bg-slate-50 dark:bg-slate-800/60 p-3.5 rounded-xl border border-slate-200 dark:border-slate-700/50 flex items-center justify-between">
+              <div className="flex items-center gap-2.5 text-slate-500 dark:text-slate-400">
+                <Layers className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                <span>Dialing Mode:</span>
+              </div>
+              <span className="font-semibold text-slate-900 dark:text-slate-100">
+                {dialingMode === 'PARALLEL' ? `Parallel (up to ${maxConcurrentCalls} at once)` : 'Sequential'}
               </span>
             </div>
           )}

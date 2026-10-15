@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { scheduledCallsService } from "../services/scheduledCalls.service";
 import type {
+  DialingMode,
   ScheduleSubmissionPayload,
   ScheduledUpload,
   ValidationError,
@@ -30,6 +31,10 @@ export function useScheduledCalls() {
   const [humanAgentPhoneNumber, setHumanAgentPhoneNumber] =
     useState<string>("+1 252 500 0184");
   const [voice, setVoice] = useState<string>(CONFIG.DEFAULT_VOICE);
+  const [dialingMode, setDialingMode] = useState<DialingMode>(
+    CONFIG.DEFAULT_DIALING_MODE,
+  );
+  const [maxConcurrentCalls, setMaxConcurrentCalls] = useState<string>("");
 
   // Validation State
   const [metaErrors, setMetaErrors] = useState<ValidationError[]>([]);
@@ -158,6 +163,17 @@ export function useScheduledCalls() {
     );
   };
 
+  const maxConcurrentError = useMemo(() => {
+    if (dialingMode !== "PARALLEL") return null;
+    const limit = CONFIG.MAX_CONCURRENT_CALLS_LIMIT;
+    if (!maxConcurrentCalls.trim()) return "Enter the max concurrent calls.";
+    const value = Number(maxConcurrentCalls);
+    if (!Number.isInteger(value) || value < 1 || value > limit) {
+      return `Max concurrent calls must be a whole number from 1 to ${limit}.`;
+    }
+    return null;
+  }, [dialingMode, maxConcurrentCalls]);
+
   const handleToggleDirectAgent = (enabled: boolean) => {
     setDirectAgentEnabled(enabled);
     setSuccessMessage(null);
@@ -177,6 +193,8 @@ export function useScheduledCalls() {
     const phoneCheck = validateHumanAgentPhone(humanAgentPhoneNumber);
     if (!phoneCheck.isValid) return false;
 
+    if (maxConcurrentError) return false;
+
     return true;
   }, [
     selectedFile,
@@ -186,6 +204,7 @@ export function useScheduledCalls() {
     selectedTimezone,
     timeError,
     humanAgentPhoneNumber,
+    maxConcurrentError,
   ]);
 
   const handleInitiateSchedule = () => {
@@ -219,6 +238,9 @@ export function useScheduledCalls() {
         directAgentEnabled,
         humanAgentPhoneNumber: humanAgentPhoneNumber.trim(),
         voice,
+        dialingMode,
+        maxConcurrentCalls:
+          dialingMode === "PARALLEL" ? Number(maxConcurrentCalls) : undefined,
       });
 
       setSuccessMessage("Calls scheduled successfully.");
@@ -306,6 +328,8 @@ export function useScheduledCalls() {
     setHumanAgentPhoneNumber("");
     setAgentPhoneError(null);
     setVoice(CONFIG.DEFAULT_VOICE);
+    setDialingMode(CONFIG.DEFAULT_DIALING_MODE);
+    setMaxConcurrentCalls("");
     setShowConfirmModal(false);
   };
 
@@ -386,6 +410,11 @@ export function useScheduledCalls() {
     agentPhoneError,
     voice,
     setVoice,
+    dialingMode,
+    setDialingMode,
+    maxConcurrentCalls,
+    setMaxConcurrentCalls,
+    maxConcurrentError,
     handleHumanAgentPhoneChange,
     handleToggleDirectAgent,
     handleFileSelect,

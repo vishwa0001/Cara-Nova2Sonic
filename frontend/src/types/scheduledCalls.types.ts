@@ -67,6 +67,7 @@ export interface CampaignPatientResult {
 }
 
 export type CallMode = 'NORMAL' | 'DIRECT_HUMAN_HANDOFF';
+export type DialingMode = 'SEQUENTIAL' | 'PARALLEL';
 
 export interface ScheduledUpload {
   id: string;
@@ -82,6 +83,8 @@ export interface ScheduledUpload {
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
   voice?: string;
+  dialingMode?: DialingMode;
+  maxConcurrentCalls?: number;
   validationSummary?: ValidationSummary;
   summary?: CampaignDispositionSummary;
   patientResults?: CampaignPatientResult[];
@@ -102,6 +105,8 @@ export interface ScheduleSubmissionPayload {
   directAgentEnabled?: boolean;
   humanAgentPhoneNumber?: string;
   voice?: string;
+  dialingMode?: DialingMode;
+  maxConcurrentCalls?: number;
   originalRecordId?: string;
 }
 

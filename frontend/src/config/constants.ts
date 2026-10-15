@@ -1,3 +1,5 @@
+import type { DialingMode } from "../types/scheduledCalls.types";
+
 export const CONFIG = {
   MAX_FILE_SIZE_MB: 10,
   MAX_FILE_SIZE_BYTES: 10 * 1024 * 1024,
@@ -18,6 +20,10 @@ export const CONFIG = {
     { value: "olivia", label: "Olivia (Australian, female)" },
     { value: "kiara", label: "Kiara (Indian, female)" },
   ],
+  // Sequential dials one call at a time; Parallel runs up to maxConcurrentCalls at once.
+  DEFAULT_DIALING_MODE: "SEQUENTIAL" as DialingMode,
+  // Most calls the current setup can run at once; the backend enforces the same cap.
+  MAX_CONCURRENT_CALLS_LIMIT: 25,
   REQUIRED_COLUMNS: [
     "empi",
     "first_name",

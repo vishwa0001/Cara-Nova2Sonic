@@ -230,6 +230,8 @@ export function mapApiRecordToScheduledUpload(raw: any): ScheduledUpload {
     directAgentEnabled: raw.directAgentEnabled ?? (raw.callMode === 'DIRECT_HUMAN_HANDOFF'),
     humanAgentPhoneNumber: raw.humanAgentPhoneNumber || undefined,
     voice: raw.voice || undefined,
+    dialingMode: raw.dialingMode || undefined,
+    maxConcurrentCalls: raw.maxConcurrentCalls || undefined,
     validationSummary,
     summary: raw.summary,
     patientResults: raw.patientResults,
@@ -303,6 +305,8 @@ class ScheduledCallsService {
         directAgentEnabled: data.directAgentEnabled,
         humanAgentPhoneNumber: data.humanAgentPhoneNumber || rawRecords[0]?.human_agent_phone,
         voice: data.voice || rawRecords[0]?.voice,
+        dialingMode: data.dialingMode || rawRecords[0]?.dialing_mode,
+        maxConcurrentCalls: data.maxConcurrentCalls || rawRecords[0]?.max_concurrent_calls,
         patientResults: mappedRecords,
       });
       upload.patientResults = mappedRecords;
@@ -343,6 +347,8 @@ class ScheduledCallsService {
           directAgentEnabled: !!payload.directAgentEnabled,
           humanAgentPhoneNumber: payload.humanAgentPhoneNumber || '',
           voice: payload.voice || CONFIG.DEFAULT_VOICE,
+          dialingMode: payload.dialingMode || CONFIG.DEFAULT_DIALING_MODE,
+          maxConcurrentCalls: payload.maxConcurrentCalls,
           timezone: payload.timezone || CONFIG.TIMEZONE.IANA,
         }),
       });
@@ -390,6 +396,8 @@ class ScheduledCallsService {
         directAgentEnabled: !!initData.directAgentEnabled,
         humanAgentPhoneNumber: initData.humanAgentPhoneNumber || payload.humanAgentPhoneNumber,
         voice: initData.voice || payload.voice,
+        dialingMode: initData.dialingMode || payload.dialingMode,
+        maxConcurrentCalls: initData.maxConcurrentCalls || payload.maxConcurrentCalls,
         validationSummary: payload.validationSummary,
         originalRecordId: payload.originalRecordId,
       };

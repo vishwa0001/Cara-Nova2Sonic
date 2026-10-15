@@ -143,6 +143,8 @@ def process_csv_content(
     human_agent_phone: str = "",
     campaign_timezone: str = "",
     voice: str = "",
+    dialing_mode: str = "",
+    max_concurrent_calls: str = "",
 ) -> Dict[str, Any]:
     """Parse, validate, and write all CSV patient rows into DynamoDB.
 
@@ -211,6 +213,10 @@ def process_csv_content(
             row_dict["timezone"] = campaign_timezone
         if voice:
             row_dict["voice"] = voice
+        if dialing_mode:
+            row_dict["dialing_mode"] = dialing_mode
+        if max_concurrent_calls:
+            row_dict["max_concurrent_calls"] = max_concurrent_calls
         mapped_rows.append(row_dict)
 
     # 1. Pre-pass validation: detect duplicate empi values within the same CSV upload
@@ -336,6 +342,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
             human_agent_phone = metadata.get("human-agent-phone") or ""
             campaign_timezone = metadata.get("timezone") or ""
             voice = metadata.get("voice") or ""
+            dialing_mode = metadata.get("dialing-mode") or ""
+            max_concurrent_calls = metadata.get("max-concurrent-calls") or ""
 
             res = process_csv_content(
                 csv_text,
@@ -347,6 +355,8 @@ def lambda_handler(event: Dict[str, Any], context: Any = None) -> Dict[str, Any]
                 human_agent_phone=human_agent_phone,
                 campaign_timezone=campaign_timezone,
                 voice=voice,
+                dialing_mode=dialing_mode,
+                max_concurrent_calls=max_concurrent_calls,
             )
             results.append(res)
 

@@ -1,5 +1,5 @@
 import React, { useRef } from 'react';
-import { CalendarClock, CheckCircle2, Headset, Loader2, Mic, Phone, RotateCcw, Send } from 'lucide-react';
+import { CalendarClock, CheckCircle2, Headset, Layers, Loader2, Mic, Phone, RotateCcw, Send } from 'lucide-react';
 import { CONFIG } from '../../config/constants';
 import { useScheduledCalls } from '../../hooks/useScheduledCalls';
 import { CustomerSheetUpload } from './components/CustomerSheetUpload';
@@ -46,6 +46,11 @@ export const ScheduledCallsPage: React.FC = () => {
     agentPhoneError,
     voice,
     setVoice,
+    dialingMode,
+    setDialingMode,
+    maxConcurrentCalls,
+    setMaxConcurrentCalls,
+    maxConcurrentError,
     handleHumanAgentPhoneChange,
     handleToggleDirectAgent,
     handleFileSelect,
@@ -80,6 +85,7 @@ export const ScheduledCallsPage: React.FC = () => {
       return 'Enter the human agent callback number';
     }
     if (agentPhoneError) return agentPhoneError;
+    if (maxConcurrentError) return maxConcurrentError;
     return null;
   };
 
@@ -241,6 +247,62 @@ export const ScheduledCallsPage: React.FC = () => {
               </p>
             </div>
 
+            {/* SECTION: Dialing Mode (Campaign-Level Setting) */}
+            <div className="bg-slate-50/70 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-800 rounded-xl p-4 sm:p-5 space-y-2">
+              <label htmlFor="dialing-mode" className="text-sm font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                <Layers className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />
+                Dialing Mode
+              </label>
+              <select
+                id="dialing-mode"
+                value={dialingMode}
+                onChange={(e) => setDialingMode(e.target.value as typeof dialingMode)}
+                className="w-full max-w-md px-3 py-2 text-xs sm:text-sm bg-white dark:bg-slate-900 border border-slate-300 dark:border-slate-700 rounded-xl shadow-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 dark:focus:ring-indigo-400 text-slate-900 dark:text-slate-100"
+              >
+                <option value="SEQUENTIAL">Sequential (one call at a time)</option>
+                <option value="PARALLEL">Parallel (several calls at once)</option>
+              </select>
+
+              {dialingMode === 'PARALLEL' && (
+                <div className="pt-3 space-y-2">
+                  <label htmlFor="max-concurrent-calls" className="block text-xs font-semibold text-slate-800 dark:text-slate-200">
+                    Max Concurrent Calls <span className="text-rose-500">*</span>
+                  </label>
+                  <input
+                    id="max-concurrent-calls"
+                    type="number"
+                    inputMode="numeric"
+                    min={1}
+                    max={CONFIG.MAX_CONCURRENT_CALLS_LIMIT}
+                    step={1}
+                    value={maxConcurrentCalls}
+                    onChange={(e) => setMaxConcurrentCalls(e.target.value)}
+                    placeholder={`1 to ${CONFIG.MAX_CONCURRENT_CALLS_LIMIT}`}
+                    className={`w-full max-w-md px-3 py-2 text-xs sm:text-sm bg-white dark:bg-slate-900 border rounded-xl shadow-sm focus:outline-none focus:ring-2 transition-all ${
+                      maxConcurrentError
+                        ? 'border-rose-300 dark:border-rose-700 focus:ring-rose-500 text-rose-900 dark:text-rose-200'
+                        : 'border-slate-300 dark:border-slate-700 focus:ring-indigo-500 dark:focus:ring-indigo-400 text-slate-900 dark:text-slate-100'
+                    }`}
+                  />
+                  {maxConcurrentError ? (
+                    <p className="text-xs text-rose-600 dark:text-rose-400 font-medium">
+                      {maxConcurrentError}
+                    </p>
+                  ) : (
+                    <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                      Up to {CONFIG.MAX_CONCURRENT_CALLS_LIMIT} calls can run at once with the current setup.
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {dialingMode === 'SEQUENTIAL' && (
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Calls in this batch are placed one at a time; the next starts when the current call ends.
+                </p>
+              )}
+            </div>
+
             {/* Validation Breakdown Summary */}
             <ValidationSummaryCallout summary={validationSummary} />
 
@@ -328,6 +390,8 @@ export const ScheduledCallsPage: React.FC = () => {
         directAgentEnabled={directAgentEnabled}
         humanAgentPhoneNumber={humanAgentPhoneNumber}
         voice={voice}
+        dialingMode={dialingMode}
+        maxConcurrentCalls={maxConcurrentCalls}
         isSubmitting={isSubmitting}
         onClose={() => setShowConfirmModal(false)}
         onConfirm={handleConfirmSchedule}

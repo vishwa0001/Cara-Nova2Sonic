@@ -201,3 +201,60 @@ async def test_schedule_retry_empty_call_id():
     )
     assert "last_call_id" not in record
 
+
+
+def _run_dialer(due, active, monkeypatch, system_max=25):
+    """Run one dialer pass with fake DynamoDB rows; returns the dialed patient_ids."""
+    monkeypatch.setattr(campaign_dialer, "SYSTEM_MAX_CONCURRENT_CALLS", system_max)
+    monkeypatch.setattr(campaign_dialer.time, "sleep", lambda _s: None)
+    table = MagicMock()
+
+    def query(**kwargs):
+        cond = kwargs["KeyConditionExpression"]
+        while cond.expression_operator != "=":  # unwrap "status = X AND scheduled_time <= now"
+            cond = cond.get_expression()["values"][0]
+        status = cond.get_expression()["values"][1]
+        if status in campaign_dialer.ACTIVE_CALL_STATUSES:
+            return {"Items": [{"campaign_id": c} for c in active] if status == "DIALING" else []}
+        return {"Items": due if status == "PENDING" else []}
+
+    table.query.side_effect = query
+    ddb = MagicMock()
+    ddb.Table.return_value = table
+    with patch("campaign_dialer._get_dynamodb_resource", return_value=ddb), \
+         patch("campaign_dialer.OutreachRecordService"), \
+         patch("campaign_dialer.resolve_ecs_gateway_url", return_value="http://gw"), \
+         patch("campaign_dialer.originate_single_call", return_value={"success": True, "call_id": "c"}):
+        result = campaign_dialer.lambda_handler({}, None)
+    return [r["patient_id"] for r in result.get("results", [])]
+
+
+def _rec(pid, campaign, mode=None, max_calls=None):
+    rec = {"patient_id": pid, "campaign_id": campaign}
+    if mode:
+        rec["dialing_mode"] = mode
+    if max_calls:
+        rec["max_concurrent_calls"] = max_calls
+    return rec
+
+
+def test_sequential_batch_dials_one_at_a_time(monkeypatch):
+    due = [_rec(f"s{i}", "A", "SEQUENTIAL") for i in range(3)]
+    assert _run_dialer(due, [], monkeypatch) == ["s0"]
+    assert _run_dialer(due, ["A"], monkeypatch) == []
+
+
+def test_parallel_batch_respects_its_own_limit(monkeypatch):
+    due = [_rec(f"p{i}", "B", "PARALLEL", 3) for i in range(5)]
+    assert _run_dialer(due, ["B"], monkeypatch) == ["p0", "p1"]
+
+
+def test_busy_sequential_batch_does_not_block_others(monkeypatch):
+    due = [_rec("s0", "A", "SEQUENTIAL"), _rec("p0", "B", "PARALLEL", 2)]
+    assert _run_dialer(due, ["A"], monkeypatch) == ["p0"]
+
+
+def test_system_limit_caps_all_batches(monkeypatch):
+    due = [_rec(f"p{i}", "B", "PARALLEL", 25) for i in range(10)]
+    assert _run_dialer(due, ["X", "Y"], monkeypatch, system_max=5) == ["p0", "p1", "p2"]
+    assert _run_dialer(due, ["X"] * 5, monkeypatch, system_max=5) == []

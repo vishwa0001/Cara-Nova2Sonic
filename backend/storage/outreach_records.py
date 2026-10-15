@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import uuid
+from decimal import Decimal
 from typing import Any, Dict, Optional
 
 import boto3
@@ -202,6 +203,13 @@ def write_patient_record(
         voice = str(patient.get("voice") or "").strip()
         if voice:
             item["voice"] = voice
+        # Campaign dialing mode; the dialer falls back to its own default when absent.
+        dialing_mode = str(patient.get("dialing_mode") or "").strip().upper()
+        if dialing_mode:
+            item["dialing_mode"] = dialing_mode
+        max_concurrent_calls = str(patient.get("max_concurrent_calls") or "").strip()
+        if max_concurrent_calls.isdigit():
+            item["max_concurrent_calls"] = int(max_concurrent_calls)
 
         if file_size_bytes and file_size_bytes > 0:
             item["file_size_bytes"] = file_size_bytes
@@ -420,6 +428,28 @@ class OutreachRecordService:
             rec["call_start_datetime"] = now
             rec["last_call_id"] = call_id
             rec["last_updated_at"] = now
+
+    def record_call_recording(self, patient_id: str, call_id: str, s3_uri: str, duration_sec: float):
+        """Store where a call's recording is in S3 on the patient's record."""
+        try:
+            self._table.update_item(
+                Key={"patient_id": patient_id},
+                UpdateExpression=(
+                    "SET recording_s3_uri = :u, recording_call_id = :c, recording_duration_sec = :d"
+                ),
+                ExpressionAttributeValues={
+                    ":u": s3_uri,
+                    ":c": call_id,
+                    ":d": Decimal(str(round(duration_sec, 1))),
+                },
+            )
+            logger.info(f"[DDB_RECORDING] patient_id={patient_id} call_id={call_id} recording={s3_uri}")
+        except Exception as e:
+            logger.warning(f"DynamoDB record_call_recording fallback/error ({e})")
+            rec = self._in_memory_store.setdefault(patient_id, {"patient_id": patient_id})
+            rec["recording_s3_uri"] = s3_uri
+            rec["recording_call_id"] = call_id
+            rec["recording_duration_sec"] = round(duration_sec, 1)
 
     async def mark_call_ended(self, patient_id: str, call_summary: str):
         """Record the call end timestamp and summary upon teardown or termination."""

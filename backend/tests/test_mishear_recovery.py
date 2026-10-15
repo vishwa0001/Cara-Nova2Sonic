@@ -111,11 +111,55 @@ class TestPrompt(unittest.TestCase):
         self.assertIn("is Travis available to talk right now?", self.prompt)
 
     def test_deceased_needs_confirmation_first(self):
-        confirm = "I’m so sorry — did you say Travis has passed away?"
-        self.assertIn(confirm, self.prompt)
-        self.assertIn(f'only after the caller confirmed "{confirm}"', self.prompt)
+        repeat = "I’m sorry — could you say that again for me?"
+        self.assertIn(repeat, self.prompt)
+        self.assertIn(
+            "stated clearly, or confirmed after repeating per HEARING MISTAKES",
+            self.prompt,
+        )
         self.assertIn("no more", self.prompt)  # listed as a death phrase
         self.assertIn("is a do-not-call request, not a death", self.prompt)
+
+    def test_clear_death_statement_skips_confirmation(self):
+        # "he passed away last week" style statements go straight to the
+        # deceased branch instead of asking the caller to repeat themselves.
+        self.assertIn(
+            "do NOT ask them to repeat it. Treat it as confirmed and go "
+            "straight to the deceased branch",
+            self.prompt,
+        )
+
+    def test_ambiguous_death_mention_still_asks_to_repeat(self):
+        # A bare word, fragment, or hedged mention is exactly the kind of
+        # thing that caused call 5c32159a's mishearing, so it still asks —
+        # using the generic, reusable "say that again" line, not a
+        # death-specific leading question.
+        self.assertIn(
+            "a bare word or fragment with no full context, mumbled, "
+            "hedged, or dropped into an otherwise unrelated sentence",
+            self.prompt,
+        )
+        self.assertIn(
+            "This is the one general-purpose line for \"please say that "
+            "again\"; use it anywhere in the call instead of guessing.",
+            self.prompt,
+        )
+
+    def test_identity_confirmation_mumble_keeps_its_own_question(self):
+        # The generic "say that again" line must not swallow SECTION 1's
+        # identity double-check: a mumbled answer to the opening greeting
+        # still gets the specific "Just to double check, is this Travis?"
+        # question, not the new general-purpose repeat line.
+        self.assertIn(
+            "EXCEPTION: this does not apply to SECTION 1's identity check.",
+            self.prompt,
+        )
+        self.assertIn(
+            'you MUST still use SECTION 1\'s own double-check question, '
+            '"Just to double check, is this Travis?", not this line',
+            self.prompt,
+        )
+        self.assertIn('Say this exact sentence: "Just to double check, is this Travis?"', self.prompt)
 
     def test_rephrase_then_close_instead_of_repeating(self):
         self.assertIn("Never say the same sentence twice in a row", self.prompt)
@@ -123,6 +167,22 @@ class TestPrompt(unittest.TestCase):
             "Sorry, I didn’t quite catch that. Is Travis available to talk right now?",
             self.prompt,
         )
+
+    def test_off_script_input_gets_deflection_not_a_restart(self):
+        # A joke request, small talk, or other unscripted remark (e.g. "can
+        # you hear me", "tell me a joke") must get a brief deflection and
+        # then resume the call where it left off — not a replay of the
+        # opening greeting or an earlier section.
+        self.assertIn(
+            "I’m so sorry — I can’t help with that.",
+            self.prompt,
+        )
+        self.assertIn(
+            "say this exact sentence once: \"I’m so sorry — I can’t help with that.\" "
+            "then immediately continue the call exactly where it left off",
+            self.prompt,
+        )
+        self.assertIn("Do NOT restart the opening greeting", self.prompt)
 
     def test_identity_rechecked_after_handover(self):
         self.assertIn('"Hi, is this Travis?"', self.prompt)
@@ -134,7 +194,8 @@ class TestPrompt(unittest.TestCase):
         for line in (
             SCRIPT_DEFINITIONS.other_person_rephrase,
             SCRIPT_DEFINITIONS.other_person_handover_check,
-            SCRIPT_DEFINITIONS.other_person_deceased_confirm,
+            SCRIPT_DEFINITIONS.clarification_repeat_request,
+            SCRIPT_DEFINITIONS.off_script_deflection,
         ):
             rendered = PATIENT.render_template(line)
             self.assertNotIn("goodbye", rendered.lower())

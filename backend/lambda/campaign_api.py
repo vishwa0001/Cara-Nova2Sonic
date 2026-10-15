@@ -59,6 +59,10 @@ TABLE_NAME = os.environ.get("OUTREACH_RECORDS_TABLE", DEFAULT_TABLE_NAME)
 # Voice keys the UI can pick; the gateway maps each to Nova + Polly voices.
 VOICES = ("joanna", "tiffany", "matthew", "amy", "olivia", "kiara")
 DEFAULT_VOICE = "joanna"
+DIALING_MODES = ("SEQUENTIAL", "PARALLEL")
+DEFAULT_DIALING_MODE = "SEQUENTIAL"
+# Most calls the current setup can run at once; the dialer enforces the same cap.
+MAX_CONCURRENT_CALLS_LIMIT = 25
 
 
 def _build_response(status_code: int, body: Any) -> Dict[str, Any]:
@@ -117,6 +121,9 @@ def _call_mode_fields(record: Dict[str, Any]) -> Dict[str, Any]:
         "directAgentEnabled": direct,
         "humanAgentPhoneNumber": record.get("human_agent_phone", ""),
         "voice": record.get("voice") or DEFAULT_VOICE,
+        # Batches scheduled before the dialing mode setting existed have neither.
+        "dialingMode": record.get("dialing_mode") or None,
+        "maxConcurrentCalls": int(record["max_concurrent_calls"]) if record.get("max_concurrent_calls") else None,
     }
 
 
@@ -144,6 +151,20 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
     if voice not in VOICES:
         return _build_response(400, {"error": f"voice must be one of: {', '.join(VOICES)}"})
 
+    dialing_mode = str(body.get("dialingMode") or DEFAULT_DIALING_MODE).strip().upper()
+    if dialing_mode not in DIALING_MODES:
+        return _build_response(400, {"error": f"dialingMode must be one of: {', '.join(DIALING_MODES)}"})
+    max_concurrent_calls = 1
+    if dialing_mode == "PARALLEL":
+        try:
+            max_concurrent_calls = int(body.get("maxConcurrentCalls"))
+        except (TypeError, ValueError):
+            max_concurrent_calls = 0
+        if not 1 <= max_concurrent_calls <= MAX_CONCURRENT_CALLS_LIMIT:
+            return _build_response(400, {
+                "error": f"maxConcurrentCalls must be a whole number from 1 to {MAX_CONCURRENT_CALLS_LIMIT}"
+            })
+
     campaign_id = generate_campaign_id()
     s3_key = f"campaigns/{campaign_id}/patients.csv"
 
@@ -154,6 +175,8 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
         "original-filename": quote(filename, safe="!~*'()"),
         "direct-agent": "yes" if direct_agent else "no",
         "voice": voice,
+        "dialing-mode": dialing_mode,
+        "max-concurrent-calls": str(max_concurrent_calls),
     }
     if agent_phone:
         metadata["human-agent-phone"] = agent_phone
@@ -189,6 +212,8 @@ def handle_presigned_url(body: Dict[str, Any]) -> Dict[str, Any]:
             "directAgentEnabled": direct_agent,
             "humanAgentPhoneNumber": agent_phone,
             "voice": voice,
+            "dialingMode": dialing_mode,
+            "maxConcurrentCalls": max_concurrent_calls,
             # Exact x-amz-meta-* headers the PUT must send to match the signature.
             "uploadHeaders": {f"x-amz-meta-{k}": v for k, v in metadata.items()},
         })

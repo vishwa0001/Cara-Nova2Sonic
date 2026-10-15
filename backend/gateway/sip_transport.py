@@ -32,6 +32,7 @@ from pipecat.frames.frames import (
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 from gateway.agent_answer_detector import HUMAN, SILENCE, AgentAnswerDetector
+from gateway.call_recorder import RECORDING_BUCKET, CallRecorder, recording_enabled
 
 logger = logging.getLogger("sip_transport")
 
@@ -104,6 +105,20 @@ def ulaw_encode(pcm_bytes: bytes) -> bytes:
     indices = (pcm_arr.astype(np.int32) + 32768).astype(np.uint16)
     ulaw_arr = _PCM_TO_ULAW_TABLE[indices]
     return ulaw_arr.tobytes()
+
+
+def _build_ringback_cycle() -> bytes:
+    """One US ringback cadence (440 + 480 Hz, 2 s on / 4 s off) as 8 kHz PCMU."""
+    t = np.arange(2 * 8000) / 8000
+    tone = 0.1 * 32767 * (np.sin(2 * np.pi * 440 * t) + np.sin(2 * np.pi * 480 * t))
+    pcm = np.concatenate([tone, np.zeros(4 * 8000)]).astype(np.int16)
+    return ulaw_encode(pcm.tobytes())
+
+
+# Played to the patient while a transfer rings the agent, so the hold isn't dead air
+RINGBACK_CYCLE = _build_ringback_cycle()
+# Tone frames kept queued ahead of the RTP clock (200 ms)
+RINGBACK_LEAD_FRAMES = 10
 
 
 def resample_pcm16_fast(audio_bytes: bytes, src_rate: int, dst_rate: int) -> bytes:
@@ -435,6 +450,8 @@ class CallRTPMediaSession:
         self._inbound_ready = asyncio.Event()
         self._pump_task: Optional[asyncio.Task] = None
         self.early_frames_dropped = 0
+        # Records both directions of an answered patient call (see call_recorder)
+        self.recorder: Optional[CallRecorder] = None
 
     async def start(self):
         """Bind dedicated UDP socket for this call."""
@@ -521,6 +538,9 @@ class CallRTPMediaSession:
                     break
             return
 
+        if self.recorder:
+            self.recorder.add_inbound(payload)
+
         if self.bridge_peer:
             self.bridge_peer.send_bridged_audio(payload)
             return
@@ -552,6 +572,8 @@ class CallRTPMediaSession:
         """Transmit 20ms PCMU RTP packet to remote telephony destination."""
         if not self.transport or self.transport.is_closing():
             return
+        if self.recorder:
+            self.recorder.add_outbound(payload)
 
         packet = RTPPacket.pack(
             payload=payload,
@@ -590,6 +612,12 @@ class SIPRTPMediaServer:
         self.remote_endpoints: Dict[str, Tuple[str, int]] = {}
         self.active_sessions: Dict[str, Any] = {}
         self._is_running = False
+        # Call recording: bucket is empty when disabled. on_recording_saved
+        # is called with (call_id, s3_uri, duration_sec, metadata) after upload.
+        self.recording_bucket = RECORDING_BUCKET if recording_enabled() else ""
+        self.on_recording_saved: Optional[Callable[..., Any]] = None
+        self._recording_meta: Dict[str, Dict[str, Any]] = {}
+        self._recording_tasks: Set[asyncio.Task] = set()
 
     async def start(self):
         self._is_running = True
@@ -630,6 +658,9 @@ class SIPRTPMediaServer:
         session = self.call_sessions.pop(contact_id, None)
         if session:
             session.stop()
+            if session.recorder:
+                self._finish_recording(contact_id, session.recorder)
+                session.recorder = None
         await self.port_pool.release_port(contact_id)
         self.remote_endpoints.pop(contact_id, None)
         self.active_sessions.pop(contact_id, None)
@@ -649,6 +680,59 @@ class SIPRTPMediaServer:
         session = self.call_sessions.get(contact_id)
         if session:
             session.answered = True
+            if self.recording_bucket and session.recorder is None:
+                self._start_recording(session)
+
+    def _start_recording(self, session: CallRTPMediaSession):
+        contact_id = session.contact_id
+        try:
+            recorder = CallRecorder(contact_id, self.recording_bucket)
+            recorder.metadata.update(self._recording_meta.get(contact_id, {}))
+            recorder.start()
+            session.recorder = recorder
+            logger.info(f"[RECORDING_START] Recording {contact_id}")
+        except Exception as e:
+            logger.warning(f"[RECORDING_ERROR] Could not start recording for {contact_id}: {e}")
+
+    def set_recording_metadata(self, contact_id: str, **metadata: Any):
+        """Details stored with the recording (patient_id, campaign_id, ...)."""
+        self._recording_meta.setdefault(contact_id, {}).update(metadata)
+        session = self.call_sessions.get(contact_id)
+        if session and session.recorder:
+            session.recorder.metadata.update(metadata)
+
+    def _finish_recording(self, contact_id: str, recorder: CallRecorder):
+        """Upload the recording in the background once the call is closed."""
+        self._recording_meta.pop(contact_id, None)
+        task = asyncio.create_task(self._upload_recording(contact_id, recorder))
+        self._recording_tasks.add(task)
+        task.add_done_callback(self._recording_tasks.discard)
+
+    async def _upload_recording(self, contact_id: str, recorder: CallRecorder):
+        try:
+            s3_uri, duration = await recorder.finalize()
+        except Exception as e:
+            logger.error(f"[RECORDING_ERROR] Could not save recording for {contact_id}: {e}")
+            return
+        if not s3_uri:
+            return
+        logger.info(f"[RECORDING_UPLOADED] {contact_id} -> {s3_uri} ({duration:.1f}s)")
+        if self.on_recording_saved:
+            try:
+                res = self.on_recording_saved(contact_id, s3_uri, duration, dict(recorder.metadata))
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception as e:
+                logger.warning(f"[RECORDING_ERROR] Saving recording details for {contact_id} failed: {e}")
+
+    async def finish_all_recordings(self, timeout: float = 20.0):
+        """On shutdown, upload recordings of calls still open (ECS gives ~30 s)."""
+        for contact_id, session in list(self.call_sessions.items()):
+            if session.recorder:
+                self._finish_recording(contact_id, session.recorder)
+                session.recorder = None
+        if self._recording_tasks:
+            await asyncio.wait(list(self._recording_tasks), timeout=timeout)
 
     def unregister_session(self, contact_id: str):
         asyncio.create_task(self.close_call_session(contact_id))
@@ -663,6 +747,9 @@ class SIPRTPMediaServer:
         b.bridge_peer = a
         a.pipeline_session = None
         b.pipeline_session = None
+        for leg, peer in ((a, call_b), (b, call_a)):
+            if leg.recorder:
+                leg.recorder.metadata.update(transferred="true", agent_leg_call_id=peer)
         logger.info(f"[BRIDGE] Joined audio of {call_a} <-> {call_b}")
         return True
 
@@ -1481,6 +1568,7 @@ class SIPRTPOutputProcessor(FrameProcessor):
         self._is_active = True
         self._had_audio_queued = False
         self.on_queue_drained = on_queue_drained
+        self._ringback_task: Optional[asyncio.Task] = None
 
     @property
     def queue(self) -> asyncio.Queue[bytes]:
@@ -1507,6 +1595,37 @@ class SIPRTPOutputProcessor(FrameProcessor):
         """Block until all queued frames are transmitted or purged."""
         while not self._outbound_queue.empty() and self._is_active:
             await asyncio.sleep(0.02)
+
+    def start_ringback(self):
+        """Ring the caller until stop_ringback(), starting once Cara's queued
+        "please hold" has played. Caller audio isn't fed to Nova during a
+        transfer, so nothing else is queued meanwhile."""
+        if self._ringback_task is None or self._ringback_task.done():
+            self._ringback_task = asyncio.create_task(self._ringback_loop())
+
+    async def stop_ringback(self):
+        task, self._ringback_task = self._ringback_task, None
+        if not task:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        while not self._outbound_queue.empty():
+            self._outbound_queue.get_nowait()
+
+    async def _ringback_loop(self):
+        await self.wait_until_queue_empty()
+        logger.info(f"[TRANSFER_RINGBACK] Ringing the caller while the agent is dialed for Contact {self.contact_id}")
+        frame = self.frame_size_bytes
+        pos = 0
+        while self._is_active:
+            if self._outbound_queue.qsize() < RINGBACK_LEAD_FRAMES:
+                await self._outbound_queue.put(RINGBACK_CYCLE[pos:pos + frame])
+                pos = (pos + frame) % len(RINGBACK_CYCLE)
+            else:
+                await asyncio.sleep(self.frame_duration_ms / 1000.0)
 
     async def _rtp_streaming_loop(self):
         """Stream 20ms G.711 u-law RTP audio chunks with precise clock timing."""

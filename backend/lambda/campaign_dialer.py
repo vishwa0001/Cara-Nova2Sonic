@@ -1,8 +1,10 @@
-"""Cara Health Bot Sequential Campaign Dialer Lambda.
+"""Cara Health Bot Campaign Dialer Lambda.
 
 Triggered every minute by EventBridge Schedule (or manually).
 Queries CareHarmony_OutreachRecords GSI CallStatusScheduledTimeIndex for due PENDING and RESCHEDULED records,
 and originates SIP calls via the ECS Voice Gateway (/calls/originate) at the configured CPS rate.
+Each batch dials SEQUENTIAL (one call at a time) or PARALLEL (up to its maxConcurrentCalls),
+and all batches together stay under SYSTEM_MAX_CONCURRENT_CALLS.
 """
 from __future__ import annotations
 
@@ -59,31 +61,47 @@ _CONFIG_DATA = _load_config()
 DIALING_MODE_DEFAULT = _CONFIG_DATA.get("dialingMode", _CONFIG_DATA.get("dialing_mode", "SEQUENTIAL"))
 MAX_CONCURRENT_DEFAULT = _CONFIG_DATA.get("maxConcurrentCalls", _CONFIG_DATA.get("max_concurrent_calls", 1 if DIALING_MODE_DEFAULT == "SEQUENTIAL" else 50))
 
+# Most calls the current setup can run at once, across all batches.
+SYSTEM_MAX_CONCURRENT_CALLS = max(1, int(os.environ.get("SYSTEM_MAX_CONCURRENT_CALLS", "25")))
+# Due records read per pass, so one busy sequential batch can't hide other batches' records.
+DUE_RECORDS_SCAN_LIMIT = 200
+
 ACTIVE_CALL_STATUSES = ("DIALING", "IN_PROGRESS", "RUNNING")
 
 
-def count_active_calls(table) -> int:
-    """Check how many calls are currently active in DIALING / IN_PROGRESS / RUNNING state."""
-    active_count = 0
+def count_active_calls_by_campaign(table) -> Dict[str, int]:
+    """Count calls in DIALING / IN_PROGRESS / RUNNING state, per campaign_id."""
+    counts: Dict[str, int] = {}
     for status in ACTIVE_CALL_STATUSES:
         try:
-            resp = table.query(
-                IndexName=INDEX_NAME,
-                KeyConditionExpression=Key("call_status").eq(status),
-                Select="COUNT",
-            )
-            active_count += int(resp.get("Count", 0))
-        except Exception:
-            try:
-                scan_resp = table.scan(
-                    FilterExpression="call_status = :st",
-                    ExpressionAttributeValues={":st": status},
-                    Select="COUNT",
-                )
-                active_count += int(scan_resp.get("Count", 0))
-            except Exception as e:
-                logger.warning(f"Error checking active calls for {status}: {e}")
-    return active_count
+            kwargs: Dict[str, Any] = {
+                "IndexName": INDEX_NAME,
+                "KeyConditionExpression": Key("call_status").eq(status),
+                "ProjectionExpression": "campaign_id",
+            }
+            while True:
+                resp = table.query(**kwargs)
+                for item in resp.get("Items", []):
+                    cid = item.get("campaign_id", "")
+                    counts[cid] = counts.get(cid, 0) + 1
+                if "LastEvaluatedKey" not in resp:
+                    break
+                kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+        except Exception as e:
+            logger.warning(f"Error checking active calls for {status}: {e}")
+    return counts
+
+
+def campaign_call_limit(record: Dict[str, Any], default_mode: str, default_max: int) -> int:
+    """How many calls this record's batch may have in flight at once."""
+    mode = str(record.get("dialing_mode") or default_mode).strip().upper()
+    if mode != "PARALLEL":
+        return 1
+    try:
+        limit = int(record.get("max_concurrent_calls") or default_max)
+    except (TypeError, ValueError):
+        limit = default_max
+    return max(1, min(limit, SYSTEM_MAX_CONCURRENT_CALLS))
 
 
 def _get_dynamodb_resource():
@@ -315,7 +333,7 @@ def lambda_handler(event: Dict[str, Any] = None, context: Any = None) -> Dict[st
     dialing_mode = os.environ.get("DIALING_MODE", cfg_data.get("dialingMode", cfg_data.get("dialing_mode", DIALING_MODE_DEFAULT))).strip().upper()
     max_concurrent = max(1, int(os.environ.get("MAX_CONCURRENT_CALLS", cfg_data.get("maxConcurrentCalls", cfg_data.get("max_concurrent_calls", MAX_CONCURRENT_DEFAULT)))))
 
-    logger.info(f"[DIALER_START] Invocation at {now_iso} (Traffic: {TRAFFIC_TYPE}, Mode: {dialing_mode}, MaxConcurrent: {max_concurrent}, CPS: {CPS_LIMIT})")
+    logger.info(f"[DIALER_START] Invocation at {now_iso} (Traffic: {TRAFFIC_TYPE}, Default mode: {dialing_mode}, Default max concurrent: {max_concurrent}, System max: {SYSTEM_MAX_CONCURRENT_CALLS}, CPS: {CPS_LIMIT})")
 
     ddb = _get_dynamodb_resource()
     table = ddb.Table(TABLE_NAME)
@@ -325,45 +343,40 @@ def lambda_handler(event: Dict[str, Any] = None, context: Any = None) -> Dict[st
     logger.info(f"[DIALER_GATEWAY] Using Gateway URL: {gateway_url}")
 
     # Check active in-flight calls
-    active_calls = count_active_calls(table)
-    logger.info(f"[DIALER_ACTIVE_CHECK] Currently active in-flight calls: {active_calls}")
+    active_by_campaign = count_active_calls_by_campaign(table)
+    active_calls = sum(active_by_campaign.values())
+    logger.info(f"[DIALER_ACTIVE_CHECK] Currently active in-flight calls: {active_calls} {active_by_campaign}")
 
-    if dialing_mode == "SEQUENTIAL":
-        if active_calls >= 1:
-            logger.info(f"[DIALER_SEQUENTIAL] {active_calls} active call(s) currently in progress. Skipping new calls until current call completes.")
-            return {
-                "statusCode": 200,
-                "dialed_count": 0,
-                "active_calls": active_calls,
-                "mode": "SEQUENTIAL",
-                "message": f"Sequential mode active: {active_calls} call(s) currently in progress. Waiting for completion.",
-                "timestamp": now_iso,
-            }
-        batch_limit = 1
-    else:  # PARALLEL
-        available_slots = max(0, max_concurrent - active_calls)
-        if available_slots <= 0:
-            logger.info(f"[DIALER_PARALLEL] Max concurrent call limit reached ({active_calls}/{max_concurrent} active). Waiting for available slots.")
-            return {
-                "statusCode": 200,
-                "dialed_count": 0,
-                "active_calls": active_calls,
-                "mode": "PARALLEL",
-                "message": f"Parallel mode limit reached ({active_calls}/{max_concurrent} active). Waiting for available slots.",
-                "timestamp": now_iso,
-            }
-        batch_limit = min(50, available_slots)
+    if active_calls >= SYSTEM_MAX_CONCURRENT_CALLS:
+        logger.info(f"[DIALER_CAPACITY] System limit reached ({active_calls}/{SYSTEM_MAX_CONCURRENT_CALLS} active). Waiting for available slots.")
+        return {
+            "statusCode": 200,
+            "dialed_count": 0,
+            "active_calls": active_calls,
+            "message": f"System limit reached ({active_calls}/{SYSTEM_MAX_CONCURRENT_CALLS} active). Waiting for available slots.",
+            "timestamp": now_iso,
+        }
 
-    due_records = query_due_records(table, now_iso, limit=batch_limit)
-    logger.info(f"[DIALER_FOUND] Found {len(due_records)} due records to dial (Mode: {dialing_mode}, Limit: {batch_limit}).")
+    # Pick due records oldest first, keeping each batch within its own limit
+    # (1 for SEQUENTIAL, maxConcurrentCalls for PARALLEL) and the total within
+    # the system limit.
+    due_records = []
+    for rec in query_due_records(table, now_iso, limit=DUE_RECORDS_SCAN_LIMIT):
+        if active_calls + len(due_records) >= SYSTEM_MAX_CONCURRENT_CALLS:
+            break
+        cid = rec.get("campaign_id", "")
+        if active_by_campaign.get(cid, 0) >= campaign_call_limit(rec, dialing_mode, max_concurrent):
+            continue
+        active_by_campaign[cid] = active_by_campaign.get(cid, 0) + 1
+        due_records.append(rec)
+    logger.info(f"[DIALER_FOUND] Selected {len(due_records)} due records to dial.")
 
     if not due_records:
         return {
             "statusCode": 200,
             "dialed_count": 0,
             "active_calls": active_calls,
-            "mode": dialing_mode,
-            "message": "No due records found at this time.",
+            "message": "No due records can be dialed at this time.",
             "timestamp": now_iso,
         }
 

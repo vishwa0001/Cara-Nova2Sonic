@@ -82,6 +82,8 @@ OPENING_AFTER_SPEECH_S = _env_float("CARA_OPENING_AFTER_SPEECH_S", 2.5)
 OPENING_CAP_S = _env_float("CARA_OPENING_CAP_S", 3.0)
 OPENING_CAP_PAUSE_S = _env_float("CARA_OPENING_CAP_PAUSE_S", 0.3)
 OPENING_POLL_S = 0.05
+# Ringback tone for the patient while a transfer dials the human agent
+TRANSFER_RINGBACK_ENABLED = os.getenv("CARA_TRANSFER_RINGBACK_ENABLED", "true").lower() == "true"
 # Silence fed to Nova while the phone rings (100 ms of 8 kHz PCM16)
 RINGING_SILENCE_FRAME = b"\x00" * 1600
 
@@ -301,7 +303,14 @@ class CaraVoicePipeline:
             if not sig_server:
                 logger.warning(f"[PIPELINE_TRANSFER] No SIP server for {self.call_id}")
                 return False
-            return await sig_server.dial_agent_and_bridge(self.call_id, agent_phone)
+            output = self.sip_output_processor
+            if output and TRANSFER_RINGBACK_ENABLED:
+                output.start_ringback()
+            try:
+                return await sig_server.dial_agent_and_bridge(self.call_id, agent_phone)
+            finally:
+                if output:
+                    await output.stop_ringback()
 
         # 1. Processors
         self.storage = OutreachRecordService()
@@ -377,6 +386,11 @@ class CaraVoicePipeline:
                 self.sip_output_processor,
             ]
             self.media_server.register_session(self.call_id, self, remote_rtp_addr)
+            self.media_server.set_recording_metadata(
+                self.call_id,
+                patient_id=self.patient.patient_id if self.patient else None,
+                campaign_id=self.campaign_id,
+            )
         else:
             self.sip_output_processor = None
             pipeline_processors = [
@@ -906,6 +920,15 @@ async def handle_sip_call_preparing(call_id: str, patient_meta: Optional[Dict[st
             await session.stop()
 
 
+async def _on_recording_saved(call_id: str, s3_uri: str, duration: float, metadata: Dict[str, Any]):
+    """Put the recording's S3 location on the patient's outreach record."""
+    patient_id = metadata.get("patient_id")
+    if not patient_id or patient_id.startswith("P-"):
+        return
+    storage = await asyncio.to_thread(OutreachRecordService)
+    await asyncio.to_thread(storage.record_call_recording, patient_id, call_id, s3_uri, duration)
+
+
 async def _record_call_started(patient_id: str, call_id: str):
     try:
         storage = await asyncio.to_thread(OutreachRecordService)
@@ -1006,7 +1029,11 @@ async def startup_event():
         port=DEFAULT_RTP_PORT,
         echo_mode=DEFAULT_ECHO_MODE,
     )
+    rtp_media_server.on_recording_saved = _on_recording_saved
     await rtp_media_server.start()
+    logger.info(
+        f"[RECORDING] Call recording {'on, bucket ' + rtp_media_server.recording_bucket if rtp_media_server.recording_bucket else 'off'}"
+    )
 
     # 2. Start SIP RFC 3261 Signaling Server (Port 5060)
     sip_signaling_server = SIPSignalingServer(
@@ -1032,11 +1059,13 @@ async def startup_event():
 
 
 @app.on_event("shutdown")
-def shutdown_event():
+async def shutdown_event():
     global worker, rtp_media_server, sip_signaling_server
     if worker:
         worker.stop()
     if rtp_media_server:
+        # Calls cut off by a redeploy still get their recording uploaded
+        await rtp_media_server.finish_all_recordings()
         rtp_media_server.stop()
     if sip_signaling_server:
         sip_signaling_server.stop()
