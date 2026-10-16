@@ -175,13 +175,15 @@ def update_ecs_service_with_image(
     service_name: str = "careharmony-voice-service",
     task_family: str = "careharmony-voice-gateway",
     desired_count: int = 1,
+    nova_sonic_region: Optional[str] = None,
+    nova_sonic_model_id: str = "amazon.nova-2-5-sonic",
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Register new task definition revision preserving all environment variables and update service."""
     ecs = session.client("ecs")
 
     if dry_run:
-        logger.info(f"[DRY-RUN] Would register task definition '{task_family}' with image '{image_uri}'")
+        logger.info(f"[DRY-RUN] Would register task definition '{task_family}' with image '{image_uri}' (model: {nova_sonic_model_id})")
         logger.info(f"[DRY-RUN] Would update ECS service '{service_name}' on cluster '{cluster_name}' with desiredCount={desired_count}")
         return {
             "task_definition_arn": f"arn:aws:ecs:{session.region_name}:task-definition/{task_family}:new",
@@ -197,15 +199,25 @@ def update_ecs_service_with_image(
     container_defs = td.get("containerDefinitions", [])
     for c in container_defs:
         c["image"] = image_uri
-        # Ensure NOVA_SONIC_REGION is us-west-2
         env = c.get("environment", [])
-        found_region = False
+        
+        # Ensure NOVA_SONIC_MODEL_ID is set
+        found_model = False
         for entry in env:
-            if entry.get("name") == "NOVA_SONIC_REGION":
-                entry["value"] = "us-west-2"
-                found_region = True
-        if not found_region:
-            env.append({"name": "NOVA_SONIC_REGION", "value": "us-west-2"})
+            if entry.get("name") == "NOVA_SONIC_MODEL_ID":
+                entry["value"] = nova_sonic_model_id
+                found_model = True
+        if not found_model:
+            env.append({"name": "NOVA_SONIC_MODEL_ID", "value": nova_sonic_model_id})
+            
+        if nova_sonic_region:
+            found_region = False
+            for entry in env:
+                if entry.get("name") == "NOVA_SONIC_REGION":
+                    entry["value"] = nova_sonic_region
+                    found_region = True
+            if not found_region:
+                env.append({"name": "NOVA_SONIC_REGION", "value": nova_sonic_region})
         c["environment"] = env
 
     remove_keys = [
@@ -245,7 +257,7 @@ def wait_and_bind_task_ip_to_chime(
     service_name: str = "careharmony-voice-service",
     vc_name: str = "careharmony-voice-connector",
     expected_task_def_arn: Optional[str] = None,
-    max_wait_seconds: int = 120,
+    max_wait_seconds: int = 240,
     dry_run: bool = False,
 ) -> Optional[str]:
     """Poll ECS task until RUNNING with expected_task_def_arn, resolve public IP from ENI, and update Chime Voice Connector termination."""
@@ -355,6 +367,9 @@ def deploy_gateway(
     cluster_name: str = "careharmony-voice-cluster",
     service_name: str = "careharmony-voice-service",
     task_family: str = "careharmony-voice-gateway",
+    image_tag: str = "nova-2-5-sonic",
+    nova_sonic_region: Optional[str] = None,
+    nova_sonic_model_id: str = "amazon.nova-2-5-sonic",
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """Execute complete containerization, ECR push, and ECS service deployment."""
@@ -368,7 +383,7 @@ def deploy_gateway(
     ecr_docker_login(session, repo_uri=repo_uri, dry_run=dry_run)
 
     # 3. Build & Push Image
-    image_uri = build_and_push_image(repo_uri=repo_uri, dry_run=dry_run)
+    image_uri = build_and_push_image(repo_uri=repo_uri, image_tag=image_tag, dry_run=dry_run)
 
     # 4. Update ECS Service
     ecs_results = update_ecs_service_with_image(
@@ -378,6 +393,8 @@ def deploy_gateway(
         service_name=service_name,
         task_family=task_family,
         desired_count=1,
+        nova_sonic_region=nova_sonic_region,
+        nova_sonic_model_id=nova_sonic_model_id,
         dry_run=dry_run,
     )
 
@@ -410,6 +427,9 @@ def main():
     parser.add_argument("--repo-name", default="careharmony-voice-gateway", help="ECR repository name")
     parser.add_argument("--cluster-name", default="careharmony-voice-cluster", help="ECS cluster name")
     parser.add_argument("--service-name", default="careharmony-voice-service", help="ECS service name")
+    parser.add_argument("--tag", default="nova-2-5-sonic", help="Docker image tag")
+    parser.add_argument("--model-id", default="amazon.nova-2-5-sonic", help="Bedrock speech model ID")
+    parser.add_argument("--nova-region", default=None, help="Bedrock Nova Sonic region (e.g. us-east-1 or us-west-2; defaults to preserving task definition)")
     args = parser.parse_args()
 
     deploy_gateway(
@@ -418,6 +438,9 @@ def main():
         repo_name=args.repo_name,
         cluster_name=args.cluster_name,
         service_name=args.service_name,
+        image_tag=args.tag,
+        nova_sonic_region=args.nova_region,
+        nova_sonic_model_id=args.model_id,
         dry_run=args.dry_run,
     )
 

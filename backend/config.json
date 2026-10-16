@@ -15,12 +15,12 @@
   "locale": "en_US",
   "voiceId": "Joanna",
   "orchestrationModelId": "us.amazon.nova-lite-v1:0",
-  "speechModelId": "amazon.nova-2-sonic-v1:0",
+  "speechModelId": "amazon.nova-2-5-sonic",
   "phoneCountryCode": "US",
   "phoneNumberType": "TOLL_FREE",
   "dialingMode": "SEQUENTIAL",
   "maxConcurrentCalls": 10,
-  "vadSilenceThresholdMs": 200,
+  "vadSilenceThresholdMs": 150,
   "allowedDestinationPrefixes": [
     "+1"
   ],

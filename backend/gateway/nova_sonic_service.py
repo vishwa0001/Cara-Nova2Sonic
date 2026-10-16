@@ -293,6 +293,25 @@ async def _synthesize_forced_closing_helper(text: str, voice: str = "") -> bytes
     return await synthesize_forced_closing(text, voice)
 
 
+# The hold line is the same for every call with a given voice: synthesize it
+# once per container so "please hold" doesn't wait on a Polly round trip.
+_hold_audio_tasks: Dict[str, "asyncio.Task[bytes]"] = {}
+
+
+def _hold_line_audio(text: str, voice: str) -> "asyncio.Task[bytes]":
+    key = f"{voice}|{text}"
+    task = _hold_audio_tasks.get(key)
+    stale = task is not None and (
+        task.get_loop() is not asyncio.get_running_loop()
+        or (task.done() and (task.cancelled() or task.exception() is not None))
+    )
+    if task is None or stale:
+        task = asyncio.create_task(_synthesize_forced_closing_helper(text, voice))
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())
+        _hold_audio_tasks[key] = task
+    return task
+
+
 # ==============================================================================
 # NOVA SONIC SPEECH-TO-SPEECH DUPLEX SESSION
 # ==============================================================================
@@ -303,7 +322,7 @@ class NovaSonicSession:
     def __init__(
         self,
         session: Optional[boto3.Session] = None,
-        model_id: str = "amazon.nova-2-sonic-v1:0",
+        model_id: str = "amazon.nova-2-5-sonic",
         system_prompt: str = "",
         contact_id: str = "",
         patient_context: Optional[PatientContext] = None,
@@ -319,7 +338,7 @@ class NovaSonicSession:
         on_purge_output: Optional[Callable[[], Any]] = None,
     ):
         self.boto_session = session
-        self.model_id = model_id
+        self.model_id = os.getenv("NOVA_SONIC_MODEL_ID", model_id)
         self.system_prompt = system_prompt
         self.contact_id = contact_id
         self.patient = patient_context
@@ -608,17 +627,17 @@ class NovaSonicSession:
             # The direct line ends with "please hold"; Nova often calls the tool
             # before its text arrives, so both played (call 7c016576)
             return
-        text = (
-            self.patient.render_template(SCRIPT_DEFINITIONS.fast_path_hold)
-            if self.patient
-            else SCRIPT_DEFINITIONS.fast_path_hold
-        )
         try:
-            pcmu_bytes = await _synthesize_forced_closing_helper(text, self._voice_key())
+            pcmu_bytes = await _hold_line_audio(self._hold_text(), self._voice_key())
             await self.on_forced_audio(pcmu_bytes)
             logger.info(f"[TRANSFER_HOLD] Played the hold line for {self.contact_id}; Nova didn't say it")
         except Exception:
             logger.exception(f"[TRANSFER_HOLD_ERROR] Could not play the hold line for {self.contact_id}")
+
+    def _hold_text(self) -> str:
+        if self.patient:
+            return self.patient.render_template(SCRIPT_DEFINITIONS.fast_path_hold)
+        return SCRIPT_DEFINITIONS.fast_path_hold
 
     def _take_direct_fallback(self) -> bool:
         """True (once) when a Direct to Human Agent call should continue as a normal call."""
@@ -1029,6 +1048,8 @@ class NovaSonicSession:
 
     async def start(self):
         """Open bidirectional stream to Nova Sonic, transmit initialization headers, and start reader task."""
+        if self.on_forced_audio:
+            _hold_line_audio(self._hold_text(), self._voice_key())
         try:
             logger.info(
                 f"[NOVA_SONIC_START] Opening bidirectional stream to {self.model_id} for Contact {self.contact_id} "
@@ -1068,8 +1089,8 @@ class NovaSonicSession:
                 "sessionStart": {
                     "inferenceConfiguration": {
                         "maxTokens": 1024,
-                        "topP": 0.9,
-                        "temperature": 0.7,
+                        "topP": 0.2,
+                        "temperature": 0.1,
                     },
                     "turnDetectionConfiguration": {
                         "endpointingSensitivity": "HIGH",
@@ -1324,6 +1345,16 @@ class NovaSonicSession:
                                             )
                                             active_call_id = self.tool_executor.call_id or self.contact_id
                                             if active_patient_id and not active_patient_id.startswith("P-"):
+                                                # terminate_call's own DB write runs as a background
+                                                # task (fire-and-forget, for latency) — wait for it so
+                                                # this correction can't be overwritten by a write that
+                                                # was actually scheduled earlier.
+                                                pending_task = getattr(self.tool_executor, "last_termination_task", None)
+                                                if pending_task and not pending_task.done():
+                                                    try:
+                                                        await pending_task
+                                                    except Exception:
+                                                        pass
                                                 try:
                                                     self.tool_executor.storage.update_call_outcome(
                                                         patient_id=active_patient_id,
@@ -1639,7 +1670,7 @@ class NovaSonicLLMService(FrameProcessor):
     def __init__(
         self,
         patient_context: PatientContext,
-        model_id: str = "amazon.nova-2-sonic-v1:0",
+        model_id: str = "amazon.nova-2-5-sonic",
         endpointing_sensitivity: str = "HIGH",
         voice: str = "ruth",
         contact_id: Optional[str] = None,
@@ -1652,7 +1683,7 @@ class NovaSonicLLMService(FrameProcessor):
     ):
         super().__init__(**kwargs)
         self.patient = patient_context
-        self.model_id = model_id
+        self.model_id = os.getenv("NOVA_SONIC_MODEL_ID", model_id)
         self.endpointing_sensitivity = endpointing_sensitivity
         self.voice = voice or os.getenv("NOVA_SONIC_VOICE", "ruth")
         self.contact_id = contact_id or f"P-{patient_context.patient_id}"

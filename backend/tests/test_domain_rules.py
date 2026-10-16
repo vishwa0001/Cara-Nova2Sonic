@@ -64,7 +64,7 @@ class TestDomainRules(unittest.TestCase):
         prompt = generate_nova_sonic_system_prompt(self.patient)
         self.assertIn("Jane Smith", prompt)
         self.assertIn("Mercy Medical Group", prompt)
-        self.assertIn("MODE 2", prompt)
+        self.assertIn("[SECTION 1: OPENING AND IDENTITY]", prompt)
         self.assertIn("911", prompt)
         self.assertIn("988", prompt)
 
@@ -81,7 +81,7 @@ class TestDomainRules(unittest.TestCase):
         prompt = generate_nova_sonic_system_prompt(direct_patient)
         self.assertIn("Robert", prompt)
         self.assertIn("Trinity Clinic", prompt)
-        self.assertIn("MODE 1 (DIRECT HANDOFF)", prompt)
+        self.assertIn("[DIRECT TO HUMAN AGENT CALL]", prompt)
         self.assertIn("evaluate_and_transfer_pes", prompt)
 
 

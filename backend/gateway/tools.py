@@ -229,13 +229,17 @@ class OutreachToolExecutor:
         # Holds references to fire-and-forget background tasks (webhook
         # dispatch, DynamoDB writes) so they aren't garbage-collected mid-flight.
         self._background_tasks: set = set()
+        # Most recent terminate_call background persist task, if any — awaited
+        # by a later disposition correction so writes land in order.
+        self.last_termination_task: Optional["asyncio.Task"] = None
 
-    def _fire_and_forget(self, coro) -> None:
+    def _fire_and_forget(self, coro) -> "asyncio.Task":
         """Schedule `coro` without blocking the caller, keeping a reference
         alive until it completes so the task can't be GC'd mid-run."""
         task = asyncio.create_task(coro)
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def evaluate_and_transfer_pes(
         self,
@@ -417,15 +421,23 @@ class OutreachToolExecutor:
                 "error": "patient_id not resolved"
             }
 
-        try:
-            update_result = self.storage.update_reschedule(
-                active_patient_id, scheduled_iso
-            )
-            reschedule_count = update_result.get("reschedule_count", 1)
-            status = update_result.get("call_status", CallDisposition.RESCHEDULED.value if hasattr(CallDisposition.RESCHEDULED, "value") else "RESCHEDULED")
+        status = CallDisposition.RESCHEDULED.value if hasattr(CallDisposition.RESCHEDULED, "value") else "RESCHEDULED"
+        # Estimated from the patient context we already have, not a DB read —
+        # the write below runs in the background, so this can't wait on the
+        # DB's own count. Good enough for what Nova says back to the caller.
+        reschedule_count = (self.patient.reschedule_count if self.patient else 0) + 1
 
-            summary = format_call_summary("RESCHEDULED")
-            await self.storage.mark_call_ended(active_patient_id, summary)
+        async def _persist_reschedule() -> None:
+            try:
+                await asyncio.to_thread(self.storage.update_reschedule, active_patient_id, scheduled_iso)
+                summary = format_call_summary("RESCHEDULED")
+                await self.storage.mark_call_ended(active_patient_id, summary)
+            except Exception:
+                logger.exception(
+                    f"[RESCHEDULE_ERROR] DynamoDB update failed for "
+                    f"{active_patient_id}"
+                )
+                return
 
             # Skipped for SIP-originated calls: no Connect contact exists
             # behind them, so this call always fails and just adds latency.
@@ -443,22 +455,17 @@ class OutreachToolExecutor:
                 except Exception as c_err:
                     logger.debug(f"Connect update_contact_attributes simulated/offline: {c_err}")
 
-            return {
-                "success": True,
-                "scheduled_time": scheduled_iso,
-                "reschedule_count": reschedule_count,
-                "call_status": status,
-                "message": f"Rescheduled for {scheduled_iso}"
-            }
-        except Exception as e:
-            logger.exception(
-                f"[RESCHEDULE_ERROR] DynamoDB update failed for "
-                f"{active_patient_id}"
-            )
-            return {
-                "success": False,
-                "error": str(e)
-            }
+        # Fired off the event loop: Bedrock hears "rescheduled" immediately
+        # instead of waiting on the DynamoDB round trip.
+        self._fire_and_forget(_persist_reschedule())
+
+        return {
+            "success": True,
+            "scheduled_time": scheduled_iso,
+            "reschedule_count": reschedule_count,
+            "call_status": status,
+            "message": f"Rescheduled for {scheduled_iso}"
+        }
 
     async def terminate_call(
         self,
@@ -520,38 +527,49 @@ class OutreachToolExecutor:
         }
         db_status = STATUS_MAP.get(final_disposition, "COMPLETED")
 
-        # Direct DynamoDB update
-        if active_patient_id and not active_patient_id.startswith("P-"):
-            try:
-                self.storage.update_call_outcome(
-                    patient_id=active_patient_id,
-                    call_id=active_call_id,
-                    call_status=db_status,
-                )
-                summary = format_call_summary(db_status, reason=disposition)
-                await self.storage.mark_call_ended(active_patient_id, summary)
-                logger.info(
-                    f"[TOOL_DB] terminate_call updated patient_id={active_patient_id} status={db_status} call_id={active_call_id}"
-                )
-            except Exception:
-                logger.exception(
-                    f"[TOOL_DB_ERROR] terminate_call DynamoDB update failed for {active_patient_id}"
-                )
+        async def _persist_termination() -> None:
+            if active_patient_id and not active_patient_id.startswith("P-"):
+                try:
+                    await asyncio.to_thread(
+                        self.storage.update_call_outcome,
+                        patient_id=active_patient_id,
+                        call_id=active_call_id,
+                        call_status=db_status,
+                    )
+                    summary = format_call_summary(db_status, reason=disposition)
+                    await self.storage.mark_call_ended(active_patient_id, summary)
+                    logger.info(
+                        f"[TOOL_DB] terminate_call updated patient_id={active_patient_id} status={db_status} call_id={active_call_id}"
+                    )
+                except Exception:
+                    logger.exception(
+                        f"[TOOL_DB_ERROR] terminate_call DynamoDB update failed for {active_patient_id}"
+                    )
 
-        try:
-            if active_call_id:
-                self.connect.update_contact_attributes(
-                    InstanceId=self.connect_instance_id,
-                    InitialContactId=active_call_id,
-                    Attributes={
-                        "RouteAction": "DISCONNECT",
-                        "SafetyDisposition": final_disposition,
-                        "CaraEndReason": final_disposition,
-                        "TerminationReason": reason,
-                    },
-                )
-        except Exception as c_err:
-            logger.debug(f"Connect update_contact_attributes simulated/offline: {c_err}")
+            # Skipped for SIP-originated calls: no Connect contact exists
+            # behind them, so this call always fails and just adds latency
+            # (matches reschedule_call/evaluate_and_transfer_pes, which already skip it).
+            if active_call_id and not self.is_sip_call:
+                try:
+                    self.connect.update_contact_attributes(
+                        InstanceId=self.connect_instance_id,
+                        InitialContactId=active_call_id,
+                        Attributes={
+                            "RouteAction": "DISCONNECT",
+                            "SafetyDisposition": final_disposition,
+                            "CaraEndReason": final_disposition,
+                            "TerminationReason": reason,
+                        },
+                    )
+                except Exception as c_err:
+                    logger.debug(f"Connect update_contact_attributes simulated/offline: {c_err}")
+
+        # Fired off the event loop: Bedrock hears the disconnect confirmation
+        # immediately instead of waiting on DynamoDB (and, for SIP calls, a
+        # Connect API call that was always going to fail anyway). Tracked so a
+        # later disposition correction (nova_sonic_service's post-speech
+        # inference) can await it first and avoid writing out of order.
+        self.last_termination_task = self._fire_and_forget(_persist_termination())
 
         return {
             "success": True,

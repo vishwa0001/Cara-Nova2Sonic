@@ -529,18 +529,14 @@ def generate_nova_sonic_system_prompt(patient: PatientContext) -> str:
     safety_medical_script    = rt(SAFETY_MEDICAL.script)
     safety_behavioral_script = rt(SAFETY_BEHAVIORAL.script)
 
-    # Rebuttal matrix — each line individually quoted
+    # Rebuttal matrix — single-tier quick redirects to minimize LLM prefill latency
     rebuttal_blocks = []
     for entry in REBUTTAL_MATRIX.values():
         quick = rt(entry.quick_redirect)
-        full = rt(entry.full_answer)
         rebuttal_blocks.append(
-            f"[{entry.topic_id}]\n"
-            f"Trigger: {entry.trigger_description}\n"
-            f'Quick Redirect: "{quick}"\n'
-            f'Full Answer: "{full}"'
+            f'- {entry.trigger_description} -> Say: "{quick}"'
         )
-    formatted_rebuttals = "\n\n".join(rebuttal_blocks)
+    formatted_rebuttals = "\n".join(rebuttal_blocks)
 
     direct_mode_block = ""
     if patient.call_mode == CallMode.MODE_1_DIRECT_HANDOFF:
@@ -690,10 +686,7 @@ If the SECOND attempt returns status="transferring":
   If it then returns status="agent_no_answer", follow the agent_no_answer branch in SECTION 3.
 
 [SECTION 5: REBUTTALS]
-Use the Quick Redirect on the first objection. Use the Full Answer only
-if they push back again or ask for detail explicitly. After any
-rebuttal, say only "{transfer_reask}" and wait for their answer. Never
-replay the greeting or the SECTION 3 opening after a rebuttal.
+If the caller asks a question or objects, answer using the matching line below, then say this exact sentence: "{transfer_reask}" and wait for their answer. Never replay the greeting or the SECTION 3 opening after a rebuttal.
 
 {formatted_rebuttals}
 

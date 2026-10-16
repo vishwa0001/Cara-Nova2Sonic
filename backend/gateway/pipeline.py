@@ -77,7 +77,7 @@ OPENING_ENABLED = os.getenv("CARA_OPENING_ENABLED", "true").lower() == "true"
 # Off: Cara's opening line is played through Polly. On: Nova is sent a text
 # cue instead (a mid-stream text block has hung Nova before, so test first).
 OPENING_CUE_ENABLED = os.getenv("CARA_OPENING_CUE_ENABLED", "false").lower() == "true"
-OPENING_SILENCE_S = _env_float("CARA_OPENING_SILENCE_S", 1.5)
+OPENING_SILENCE_S = _env_float("CARA_OPENING_SILENCE_S", 0.0)
 OPENING_AFTER_SPEECH_S = _env_float("CARA_OPENING_AFTER_SPEECH_S", 2.5)
 OPENING_CAP_S = _env_float("CARA_OPENING_CAP_S", 3.0)
 OPENING_CAP_PAUSE_S = _env_float("CARA_OPENING_CAP_PAUSE_S", 0.3)
@@ -732,8 +732,16 @@ class KVSStreamConsumerWorker:
         if contact_id in self.active_sessions:
             return self.active_sessions[contact_id]
 
-        # Attempt to fetch patient attributes from Amazon Connect if available
-        if DEFAULT_CONNECT_INSTANCE and contact_id != "live-contact" and "-" in contact_id and len(contact_id) >= 30:
+        # Attempt to fetch patient attributes from Amazon Connect if available.
+        # Skipped for SIP calls: no Connect contact exists behind them, and this
+        # sync call blocked the event loop (and other calls' audio) while it failed.
+        if (
+            not self.media_server
+            and DEFAULT_CONNECT_INSTANCE
+            and contact_id != "live-contact"
+            and "-" in contact_id
+            and len(contact_id) >= 30
+        ):
             try:
                 connect = self.session.client("connect")
                 attrs_resp = connect.get_contact_attributes(
